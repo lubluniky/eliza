@@ -2033,6 +2033,29 @@ public class ElizaAgentService extends Service {
                 Log.i(TAG, "Hybrid cloud inference enabled: ELIZAOS_CLOUD_API_KEY"
                     + " injected from prefs (len=" + cloudInferenceKey.length() + ")");
             }
+            // Direct-provider inference override (bypasses the Eliza Cloud gateway
+            // ~5s/call tax): when the app writes a raw OpenAI-compatible key +
+            // base URL into prefs, plugin-openai talks straight to the provider
+            // (e.g. api.cerebras.ai) at ~0.2s/call. Each pref is copied verbatim
+            // to the matching env var; all absent → no-op (the cloud path above
+            // stays in effect). Model overrides let a Cerebras deployment pin
+            // gpt-oss-120b for TEXT_SMALL/LARGE.
+            copyPrefToEnv(agentEnv, "eliza:openai-api-key", "OPENAI_API_KEY");
+            copyPrefToEnv(agentEnv, "eliza:openai-base-url", "OPENAI_BASE_URL");
+            copyPrefToEnv(agentEnv, "eliza:openai-small-model", "OPENAI_SMALL_MODEL");
+            copyPrefToEnv(agentEnv, "eliza:openai-large-model", "OPENAI_LARGE_MODEL");
+            if (readCapacitorPref(this, "eliza:openai-api-key") != null) {
+                Log.i(TAG, "Direct-provider inference override: OPENAI_* injected"
+                    + " from prefs (bypassing Eliza Cloud gateway)");
+            }
+            // Camera bridge (plugin-vision → WebView ElizaCamera) is OFF by
+            // default: its continuous CAMERA-mode capture cycles the preview and
+            // flashes the screen. Only enable when the user actually wants
+            // on-device vision; plugin-vision reads this env to gate registration.
+            String cameraBridge = readCapacitorPref(this, "eliza:enable-camera-bridge");
+            if ("1".equals(cameraBridge) || "true".equalsIgnoreCase(cameraBridge)) {
+                agentEnv.put("ELIZA_ENABLE_CAMERA_BRIDGE", "1");
+            }
             // Local passwordless mode: the on-device agent trusts its own sealed
             // request socket so the single device owner never hits a login/pairing
             // gate. The per-boot bearer-token guard (ELIZA_REQUIRE_LOCAL_AUTH=1)
@@ -3813,6 +3836,16 @@ public class ElizaAgentService extends Service {
         } catch (Exception e) {
             Log.w(TAG, "Unable to read Capacitor pref " + key, e);
             return null;
+        }
+    }
+
+    /** Copy a CapacitorStorage pref verbatim into the agent env under envKey;
+     *  no-op when the pref is unset/empty so unconfigured vars never override. */
+    private void copyPrefToEnv(
+            java.util.Map<String, String> agentEnv, String prefKey, String envKey) {
+        String value = readCapacitorPref(this, prefKey);
+        if (value != null && !value.isEmpty()) {
+            agentEnv.put(envKey, value);
         }
     }
 
