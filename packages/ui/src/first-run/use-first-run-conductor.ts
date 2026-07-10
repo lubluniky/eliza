@@ -4,7 +4,8 @@
  * Onboarding is PART OF THE CHAT. When `firstRunComplete === false` this hook
  * seeds synthetic assistant turns into the SAME live transcript the floating
  * `ContinuousChatOverlay` renders (greeting → runtime CHOICE → provider
- * CHOICE → tutorial CHOICE; Cloud-only sign-in stays a single CTA), and
+ * CHOICE → tutorial CHOICE; Cloud-only sign-in uses a greeting followed by a
+ * single CTA), and
  * routes the user's first-run-scoped picks to the headless finish use case
  * (`first-run-finish.ts`). It owns NO presentation — the existing
  * `InlineWidgetText` + `SensitiveRequestBlock` renderers draw the widgets for
@@ -120,8 +121,10 @@ const GREETING =
 // open, same-tab /login navigation where popups are blocked or hostile,
 // #15143). Keep this as one obvious CTA; the Cloud flow itself owns OAuth and
 // provisioning, so there is no second in-chat "Connect" step.
-const CLOUD_SIGN_IN_GREETING = "Hi — I'm Eliza.";
+const CLOUD_SIGN_IN_GREETING = "Hi, I'm Eliza.";
 const CLOUD_SIGN_IN_CHOICE = [
+  "Sign in here.",
+  "",
   "[CHOICE:first-run id=runtime]",
   `${FIRST_RUN_ACTION_PREFIX}runtime:cloud=Sign in to Eliza Cloud`,
   "[/CHOICE]",
@@ -403,7 +406,7 @@ export function surfaceCloudLoginRetryTurn(writer: FirstRunTurnWriter): void {
   // (whose tap re-enters the cloud flow with a fresh user gesture).
   const retryText = isRuntimeChooserEnabled()
     ? `Sign in to Eliza Cloud to continue. You can also pick how to run your agent again.\n\n${runtimeChoiceBlock()}`
-    : `${CLOUD_SIGN_IN_GREETING}\n\n${CLOUD_SIGN_IN_CHOICE}`;
+    : CLOUD_SIGN_IN_CHOICE;
   const connectTurn = makeTurn("first-run:cloud-oauth", retryText);
   writer.seedTurn(connectTurn);
   writer.replaceTurn("first-run:cloud-oauth", connectTurn);
@@ -1390,12 +1393,8 @@ export function useFirstRunConductor(): void {
       // THIS path only — a greeting was genuinely shown, so silently yanking
       // the conversation would read as broken.
       const seedSignInGreetingAndPoll = () => {
-        seedTurn(
-          makeTurn(
-            "first-run:greeting",
-            `${CLOUD_SIGN_IN_GREETING}\n\n${CLOUD_SIGN_IN_CHOICE}`,
-          ),
-        );
+        seedTurn(makeTurn("first-run:greeting", CLOUD_SIGN_IN_GREETING));
+        seedTurn(makeTurn("first-run:cloud-oauth", CLOUD_SIGN_IN_CHOICE));
         startTokenPoll();
       };
       const onNativeResume = () => {
@@ -1485,12 +1484,7 @@ export function useFirstRunConductor(): void {
         localInference: cloudResume.localInference,
       };
       pendingCloudResumeRef.current = cloudResume.runtime;
-      seedTurn(
-        makeTurn(
-          "first-run:cloud-oauth",
-          `${CLOUD_SIGN_IN_GREETING}\n\n${CLOUD_SIGN_IN_CHOICE}`,
-        ),
-      );
+      seedTurn(makeTurn("first-run:cloud-oauth", CLOUD_SIGN_IN_CHOICE));
       // If the durable token already made the connection live at launch, the
       // auto-resume effect above fired once before this marker was armed, so it
       // won't self-fire — resume now. Otherwise leave the marker armed for the

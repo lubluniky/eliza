@@ -954,19 +954,28 @@ function shellToChatMessageData(m: ShellMessage): ChatMessageData {
   return data;
 }
 
-const FIRST_RUN_SIGN_IN_FALLBACK_MESSAGE: ShellMessage = {
-  id: "first-run:cloud-signin-fallback",
-  role: "assistant",
-  source: "first_run",
-  createdAt: 0,
-  content: [
-    "Hi — I'm Eliza.",
-    "",
-    "[CHOICE:first-run id=runtime]",
-    "__first_run__:runtime:cloud=Sign in to Eliza Cloud",
-    "[/CHOICE]",
-  ].join("\n"),
-};
+const FIRST_RUN_SIGN_IN_FALLBACK_MESSAGES: ShellMessage[] = [
+  {
+    id: "first-run:greeting-fallback",
+    role: "assistant",
+    source: "first_run",
+    createdAt: 0,
+    content: "Hi, I'm Eliza.",
+  },
+  {
+    id: "first-run:cloud-signin-fallback",
+    role: "assistant",
+    source: "first_run",
+    createdAt: 1,
+    content: [
+      "Sign in here.",
+      "",
+      "[CHOICE:first-run id=runtime]",
+      "__first_run__:runtime:cloud=Sign in to Eliza Cloud",
+      "[/CHOICE]",
+    ].join("\n"),
+  },
+];
 const FIRST_RUN_SIGN_IN_FALLBACK_DELAY_MS = 600;
 
 function isFirstRunShellMessage(m: ShellMessage): boolean {
@@ -983,13 +992,19 @@ function selectFirstRunDisplayMessages(
 ): ShellMessage[] {
   const firstRunMessages = messages.filter(isFirstRunShellMessage);
   if (firstRunMessages.length === 0) {
-    return showFallback ? [FIRST_RUN_SIGN_IN_FALLBACK_MESSAGE] : [];
+    return showFallback ? FIRST_RUN_SIGN_IN_FALLBACK_MESSAGES : [];
   }
 
   const latest = firstRunMessages.at(-1);
   if (!latest) return [];
 
   const previous = firstRunMessages.at(-2);
+  if (
+    previous?.id === "first-run:greeting" &&
+    latest.id === "first-run:cloud-oauth"
+  ) {
+    return [previous, latest];
+  }
   if (
     previous?.id === "first-run:appearance" &&
     latest.id === "first-run:tutorial"
