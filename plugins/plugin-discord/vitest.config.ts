@@ -1,7 +1,7 @@
 /**
  * Vitest config for the Discord plugin's unit tests. Aliases unbuilt workspace
- * deps (`@elizaos/plugin-commands`, `@elizaos/plugin-meetings`) to their source
- * so tests resolve without a prebuild of those packages.
+ * deps (`@elizaos/core`, command/meeting plugins, and core's workspace
+ * re-exports) to source so tests resolve without prebuilding those packages.
  */
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,10 @@ import { defineConfig } from "vitest/config";
 
 const pluginRoot = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(pluginRoot, "../..");
+const coreSrc = path.join(repoRoot, "packages/core/src");
+const sharedSrc = path.join(repoRoot, "packages/shared/src");
+const loggerSrc = path.join(repoRoot, "packages/logger/src");
+const cloudRoutingSrc = path.join(repoRoot, "packages/cloud/routing/src");
 
 export default defineConfig({
 	resolve: {
@@ -19,6 +23,34 @@ export default defineConfig({
 		// source instead — mirrors the same alias pattern other plugins use for
 		// unbuilt workspace deps.
 		alias: [
+			{
+				find: /^@elizaos\/shared\/(.*)\.js$/,
+				replacement: path.join(sharedSrc, "$1.ts"),
+			},
+			{
+				find: /^@elizaos\/shared\/(.*)$/,
+				replacement: path.join(sharedSrc, "$1.ts"),
+			},
+			{
+				find: "@elizaos/shared",
+				replacement: path.join(sharedSrc, "index.ts"),
+			},
+			{
+				find: /^@elizaos\/core\/(.*)\.js$/,
+				replacement: path.join(coreSrc, "$1.ts"),
+			},
+			{
+				find: "@elizaos/core",
+				replacement: path.join(coreSrc, "index.node.ts"),
+			},
+			{
+				find: "@elizaos/cloud-routing",
+				replacement: path.join(cloudRoutingSrc, "index.ts"),
+			},
+			{
+				find: "@elizaos/logger",
+				replacement: path.join(loggerSrc, "index.ts"),
+			},
 			{
 				find: /^@elizaos\/plugin-commands$/,
 				replacement: path.join(
