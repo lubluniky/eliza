@@ -187,6 +187,82 @@ async function resumeAudioContextForPlayback(
   }
 }
 
+/** Sniff a container mime from the first bytes so the <audio> fallback tags its
+ *  blob correctly (WAV `RIFF`, MP3 `ID3`/frame-sync); default to mpeg. */
+function sniffAudioMime(bytes: Uint8Array): string {
+  if (
+    bytes.length >= 4 &&
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46
+  ) {
+    return "audio/wav";
+  }
+  if (bytes.length >= 3 && bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) {
+    return "audio/mpeg";
+  }
+  if (bytes.length >= 2 && bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0) {
+    return "audio/mpeg";
+  }
+  return "audio/mpeg";
+}
+
+/** Try Web Audio decode; return null (never throw) when the WebView lacks the
+ *  codec (LightOS/Light Phone III has no MP3 decoder) so the caller can fall
+ *  back to an <audio> element that decodes through the platform MediaPlayer. */
+async function decodeAudioDataOrNull(
+  ctx: AudioContext,
+  data: ArrayBuffer,
+): Promise<AudioBuffer | null> {
+  try {
+    return await ctx.decodeAudioData(data);
+  } catch {
+    // error-policy:J4 codec-missing WebView → signal fallback, do not crash TTS.
+    return null;
+  }
+}
+
+/** Build an <audio> element (paused) for a raw audio byte buffer. */
+function createAudioElementForBytes(bytes: Uint8Array): HTMLAudioElement {
+  const blob = new Blob([bytes.slice()], { type: sniffAudioMime(bytes) });
+  const el = new Audio();
+  el.src = URL.createObjectURL(blob);
+  el.preload = "auto";
+  return el;
+}
+
+/** Play an <audio> element to its end (or error), revoking the object URL.
+ *  Resolves on ended/error so the TTS queue advances either way. */
+async function playAudioElementToEnd(
+  el: HTMLAudioElement,
+  onFinish?: () => void,
+): Promise<void> {
+  const url = el.src;
+  try {
+    await new Promise<void>((resolve) => {
+      const done = () => {
+        el.onended = null;
+        el.onerror = null;
+        resolve();
+      };
+      el.onended = done;
+      // A playback error still resolves — a stuck reply must not wedge the queue.
+      el.onerror = done;
+      el.play().catch(() => done());
+    });
+  } finally {
+    onFinish?.();
+    if (url.startsWith("blob:")) {
+      try {
+        URL.revokeObjectURL(url);
+      } catch {
+        /* ok */
+      }
+    }
+  }
+}
+
 function shouldPreferNativeTalkMode(): boolean {
   if (typeof window === "undefined") return false;
   return Capacitor.isNativePlatform() || !!getElectrobunRendererRpc();
@@ -519,6 +595,11 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
   // ── ElevenLabs Web Audio refs ──────────────────────────────────────
   const analyserRef = useRef<AnalyserNode | null>(null);
   const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  // Fallback player for WebViews whose Web Audio API can't decode the cloud's
+  // audio/mpeg (LightOS on the Light Phone III ships no MP3 decoder, so
+  // `decodeAudioData` throws). An <audio> element plays through the platform
+  // MediaPlayer instead; held here so barge-in / stopSpeaking can pause it.
+  const mediaElementRef = useRef<HTMLAudioElement | null>(null);
   const timeDomainDataRef = useRef<Float32Array<ArrayBuffer> | null>(null);
   const usingAudioAnalysisRef = useRef(false);
   const mouthOpenRef = useRef(0);
@@ -1581,6 +1662,18 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
       audioSourceRef.current = null;
     }
 
+    // <audio>-element fallback (MP3-decoder-less WebViews) — pause + release so
+    // barge-in silences it like the Web Audio path above.
+    if (mediaElementRef.current) {
+      try {
+        mediaElementRef.current.pause();
+        mediaElementRef.current.src = "";
+      } catch {
+        /* ok */
+      }
+      mediaElementRef.current = null;
+    }
+
     // Native TalkMode TTS — interrupt any in-flight native speak so barge-in
     // actually silences the agent. Without this the awaited TalkMode.speak()
     // plays to completion and the agent talks over the user.
@@ -2048,8 +2141,37 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
       }
 
       if (generation !== generationRef.current) return;
-      const audioBuffer = await ctx.decodeAudioData(toArrayBuffer(audioBytes));
+      const audioBuffer = await decodeAudioDataOrNull(
+        ctx,
+        toArrayBuffer(audioBytes),
+      );
       if (generation !== generationRef.current) return;
+      if (!audioBuffer) {
+        // WebView can't decode the cloud's audio/mpeg (no MP3 codec on LightOS /
+        // Light Phone III). Play through an <audio> element (platform
+        // MediaPlayer) so the reply is still spoken. No visualiser tap here.
+        ttsDebug("play:decode-fallback-audio-element", {
+          provider: "eliza-cloud",
+          bytes: audioBytes.byteLength,
+        });
+        markAudioPlaying();
+        emitPlaybackStart({
+          text,
+          segment: task.segment,
+          provider: "eliza-cloud",
+          cached,
+          startedAtMs: performance.now(),
+          ...task.telemetry,
+        });
+        const element = createAudioElementForBytes(audioBytes);
+        mediaElementRef.current = element;
+        try {
+          await playAudioElementToEnd(element, clearSpeechTimers);
+        } finally {
+          if (mediaElementRef.current === element) mediaElementRef.current = null;
+        }
+        return;
+      }
 
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 2048;
