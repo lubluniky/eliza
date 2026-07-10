@@ -9,6 +9,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
+import { registerInProcessServerDispatch } from "./dispatch-route.ts";
 import { createRequire } from "node:module";
 
 function tokenMatches(expected: string, provided: string): boolean {
@@ -4012,7 +4013,10 @@ export async function startApiServer(opts?: {
     `[eliza-api] Creating http server (${Date.now() - apiStartTime}ms)`,
   );
   apiLap("pre-createServer (route imports + middleware setup done)");
-  const server = http.createServer(async (req, res) => {
+  const serveHttpRequest = async (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ): Promise<void> => {
     try {
       await handleRequest(req, res, state, {
         onRestart,
@@ -4036,7 +4040,14 @@ export async function startApiServer(opts?: {
       addLog("error", msg, "api", ["server", "api"]);
       error(res, msg, 500);
     }
-  });
+  };
+  // Expose the fully-wired request handler so local-agent IPC transports
+  // (Android/iOS/Electrobun bridges, which bind no TCP socket) can dispatch the
+  // COMPLETE route set in-process — not just the plugin-route kernel. Without
+  // this the on-device WebView reaches only plugin routes and every core route
+  // (/api/conversations, /api/agents/:id/message, …) 404s, so chat can't send.
+  registerInProcessServerDispatch(serveHttpRequest);
+  const server = http.createServer(serveHttpRequest);
   if (
     isMobilePlatform() ||
     process.env.ELIZA_DEVICE_BRIDGE_ENABLED?.trim() === "1"

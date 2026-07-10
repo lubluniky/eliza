@@ -303,6 +303,25 @@ function buildLegacyShim(args: {
     const v = incomingHeaders[name.toLowerCase()];
     return Array.isArray(v) ? v[0] : v;
   };
+  // Minimal socket/connection stub so the FULL server request handler (used by
+  // the local-agent IPC dispatch — Android/iOS/Electrobun bridges) can read
+  // remoteAddress / lifecycle without a real TCP socket. Plugin routeHandlers
+  // never touch these; the extra surface is inert on the legacy path.
+  const socketStub = {
+    remoteAddress: "127.0.0.1",
+    remotePort: 0,
+    encrypted: false,
+    destroyed: false,
+    writable: true,
+    setTimeout: () => socketStub,
+    setNoDelay: () => socketStub,
+    setKeepAlive: () => socketStub,
+    on: () => socketStub,
+    once: () => socketStub,
+    removeListener: () => socketStub,
+  };
+  (req as unknown as { socket: unknown }).socket = socketStub;
+  (req as unknown as { connection: unknown }).connection = socketStub;
 
   const captured: CapturedResponse = {
     statusCode: 200,
@@ -347,6 +366,43 @@ function buildLegacyShim(args: {
     removeHeader: (name: string) => {
       delete captured.headers[name.toLowerCase()];
     },
+    // Raw Node response surface used by the FULL server handlers (conversation /
+    // chat SSE streaming) but not by plugin routeHandlers: writeHead sets the
+    // status+headers, the event/lifecycle members are inert stubs so a handler
+    // that registers res.on("close") or checks res.writableEnded does not throw.
+    writeHead(
+      code: number,
+      headersOrReason?: unknown,
+      maybeHeaders?: unknown,
+    ) {
+      captured.statusCode = code;
+      const h = (
+        headersOrReason && typeof headersOrReason === "object"
+          ? headersOrReason
+          : maybeHeaders
+      ) as Record<string, string | number | string[]> | undefined;
+      if (h) {
+        for (const [k, v] of Object.entries(h)) setHeader(k, v);
+      }
+      return res;
+    },
+    header: setHeader,
+    hasHeader: (name: string) => captured.headers[name.toLowerCase()] != null,
+    flushHeaders: () => {},
+    get writableEnded() {
+      return captured.ended;
+    },
+    get writable() {
+      return !captured.ended;
+    },
+    get destroyed() {
+      return false;
+    },
+    on: () => res,
+    once: () => res,
+    off: () => res,
+    removeListener: () => res,
+    emit: () => false,
     write: (chunk: unknown) => {
       writeChunk(chunk);
       return true;
@@ -441,6 +497,67 @@ function capturedToResult(captured: CapturedResponse): RouteHandlerResult {
     headers: captured.headers,
     body,
   };
+}
+
+// ── Local-agent IPC full-server dispatch ────────────────────────────────────
+//
+// dispatchRoute() above only serves PLUGIN routes (runtime.routes). The CORE
+// server routes — /api/conversations, POST /api/agents/:id/message,
+// /api/views, /api/memory, … — live in the http.Server request handler
+// (server.ts handleRequest), which the local-agent IPC bridges (Android/iOS/
+// Electrobun) have no socket to reach. startApiServer registers that fully
+// wired handler here so the bridges drive the COMPLETE route set in-process via
+// a synthetic req/res. Without it, on-device chat cannot create a conversation
+// or stream a reply — every send 404s "No local route". Re-entrancy is safe:
+// the registered handler internally calls dispatchRoute (plugin routes only),
+// never back into this dispatcher.
+type InProcessServerDispatchHandler = (
+  req: IncomingMessage,
+  res: ServerResponse,
+) => Promise<void> | void;
+
+let inProcessServerDispatch: InProcessServerDispatchHandler | null = null;
+
+/** Register the fully-wired http.Server request handler for in-process IPC dispatch. */
+export function registerInProcessServerDispatch(
+  handler: InProcessServerDispatchHandler,
+): void {
+  inProcessServerDispatch = handler;
+}
+
+/**
+ * Drive the full server request handler in-process with a synthetic req/res and
+ * return the buffered result. For SSE, `onChunk` fires live as the handler
+ * flushes; the returned result still carries the full captured body. Returns
+ * `null` when no handler is registered or the handler served nothing (so the
+ * caller can fall through to its 404).
+ */
+export async function dispatchViaInProcessServer(args: {
+  method: string;
+  /** Full agent-relative path, query string included. */
+  path: string;
+  headers: Record<string, string>;
+  body: unknown;
+  rawBody?: string;
+  query?: Record<string, string | string[]>;
+  onChunk?: (chunk: Buffer) => void;
+}): Promise<RouteHandlerResult | null> {
+  const handler = inProcessServerDispatch;
+  if (!handler) return null;
+  const { req, res, captured } = buildLegacyShim({
+    method: args.method,
+    path: args.path,
+    headers: args.headers,
+    query: args.query ?? {},
+    params: {},
+    body: args.body,
+    rawBody: args.rawBody,
+    onChunk: args.onChunk,
+  });
+  await handler(req, res);
+  // Handler wrote nothing and never ended → it did not own this route.
+  if (!captured.ended && captured.chunks.length === 0) return null;
+  return capturedToResult(captured);
 }
 
 /**

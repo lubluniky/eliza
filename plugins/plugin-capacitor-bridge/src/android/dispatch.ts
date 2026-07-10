@@ -41,6 +41,24 @@ export type AndroidDispatchRoute = (args: {
 	onChunk?: (chunk: Buffer) => void;
 }) => Promise<RouteHandlerResult | null | undefined>;
 
+/**
+ * Full in-process server dispatch (from `@elizaos/agent/api`
+ * `dispatchViaInProcessServer`). Covers the CORE server routes that
+ * {@link AndroidDispatchRoute} (plugin routes only) does not — /api/conversations,
+ * POST /api/agents/:id/message, /api/views, /api/memory, … — so the on-device
+ * WebView can create conversations and stream chat replies over the IPC bridge.
+ */
+export type AndroidFullServerDispatch = (args: {
+	method: string;
+	/** Full agent-relative path, query string included. */
+	path: string;
+	headers: Record<string, string>;
+	body: unknown;
+	rawBody?: string;
+	query?: Record<string, string | string[]>;
+	onChunk?: (chunk: Buffer) => void;
+}) => Promise<RouteHandlerResult | null | undefined>;
+
 /** The `http_request` / `http_request_stream` payload the native side sends. */
 export interface AndroidRequestPayload {
 	method?: unknown;
@@ -473,6 +491,7 @@ export async function dispatchBufferedRequest(
 	dispatchRoute: AndroidDispatchRoute,
 	payload: AndroidRequestPayload,
 	coreRoutes?: AndroidCoreRouteDeps,
+	dispatchFullServer?: AndroidFullServerDispatch,
 ): Promise<AndroidBufferedResponse> {
 	const rawPath = typeof payload.path === "string" ? payload.path.trim() : "";
 	if (!rawPath || !isSafeLocalPath(rawPath)) {
@@ -506,17 +525,44 @@ export async function dispatchBufferedRequest(
 		isAuthorized: () => true,
 	});
 
-	if (!result) return notFound(method, pathname);
+	if (result) {
+		const { bytes, headers: responseHeaders } = resultBodyBytes(result);
+		return {
+			status: result.status,
+			statusText: statusText(result.status),
+			headers: responseHeaders,
+			body: bytes.toString("utf8"),
+			bodyBase64: bytes.toString("base64"),
+			bodyEncoding: "base64",
+		};
+	}
 
-	const { bytes, headers: responseHeaders } = resultBodyBytes(result);
-	return {
-		status: result.status,
-		statusText: statusText(result.status),
-		headers: responseHeaders,
-		body: bytes.toString("utf8"),
-		bodyBase64: bytes.toString("base64"),
-		bodyEncoding: "base64",
-	};
+	// Plugin routes missed → fall through to the FULL server route set
+	// (conversations / agents / views / memory / …) that the plugin-only
+	// dispatchRoute above cannot serve. This is what lets the on-device WebView
+	// create a conversation and post a message; without it every send 404s.
+	if (dispatchFullServer) {
+		const full = await dispatchFullServer({
+			method,
+			path: rawPath,
+			headers,
+			body: payloadBody(payload),
+			query,
+		});
+		if (full) {
+			const { bytes, headers: responseHeaders } = resultBodyBytes(full);
+			return {
+				status: full.status,
+				statusText: statusText(full.status),
+				headers: responseHeaders,
+				body: bytes.toString("utf8"),
+				bodyBase64: bytes.toString("base64"),
+				bodyEncoding: "base64",
+			};
+		}
+	}
+
+	return notFound(method, pathname);
 }
 
 /**
@@ -533,6 +579,7 @@ export async function dispatchStreamingRequest(
 	payload: AndroidRequestPayload,
 	sink: StdioBridgeStreamSink,
 	coreRoutes?: AndroidCoreRouteDeps,
+	dispatchFullServer?: AndroidFullServerDispatch,
 ): Promise<void> {
 	const rawPath = typeof payload.path === "string" ? payload.path.trim() : "";
 	if (!rawPath || !isSafeLocalPath(rawPath)) {
@@ -585,6 +632,32 @@ export async function dispatchStreamingRequest(
 	});
 
 	if (!result) {
+		// Plugin routes missed → drive the FULL server route set. SSE handlers
+		// (e.g. /api/conversations/:id/messages/stream) flush via onChunk, so the
+		// head is emitted on the first flush and token frames forward live; a
+		// buffered route served here emits head + body once (headSent guards the
+		// double-send). This is what makes on-device streaming chat work.
+		if (dispatchFullServer) {
+			const full = await dispatchFullServer({
+				method,
+				path: rawPath,
+				headers,
+				body: payloadBody(payload),
+				query,
+				onChunk: (chunk) => {
+					emitHead(200, { "content-type": "text/event-stream" });
+					sink.emitChunk(chunk.toString("base64"));
+				},
+			});
+			if (full) {
+				if (!headSent) {
+					emitHead(full.status, full.headers ?? {});
+					const { bytes } = resultBodyBytes(full);
+					if (bytes.length) sink.emitChunk(bytes.toString("base64"));
+				}
+				return;
+			}
+		}
 		const nf = notFound(method, pathname);
 		emitHead(nf.status, nf.headers);
 		if (nf.bodyBase64) sink.emitChunk(nf.bodyBase64);

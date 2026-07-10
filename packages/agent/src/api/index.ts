@@ -50,6 +50,8 @@ export * from "./diagnostics-routes.ts";
 export {
   type DispatchRouteArgs,
   dispatchRoute,
+  dispatchViaInProcessServer,
+  registerInProcessServerDispatch,
 } from "./dispatch-route.ts";
 export * from "./documents-service-loader.ts";
 export * from "./early-logs.ts";

@@ -71,6 +71,7 @@ import {
 import {
 	type AndroidCoreRouteDeps,
 	type AndroidDispatchRoute,
+	type AndroidFullServerDispatch,
 	type AndroidRequestPayload,
 	dispatchBufferedRequest,
 	dispatchStreamingRequest,
@@ -84,6 +85,8 @@ type StartEliza = (options: {
 interface AndroidAgentModule {
 	startEliza: StartEliza;
 	dispatchRoute: AndroidDispatchRoute;
+	/** Full in-process server dispatch — the CORE route set (conversations, etc.). */
+	dispatchViaInProcessServer: AndroidFullServerDispatch;
 	/** Persisted-config seams for the server-level core routes (first-run). */
 	coreRoutes: AndroidCoreRouteDeps;
 }
@@ -99,6 +102,7 @@ async function loadAgentModule(): Promise<AndroidAgentModule> {
 	const mod = (await import(/* @vite-ignore */ "@elizaos/agent")) as {
 		startEliza: StartEliza;
 		dispatchRoute: AndroidDispatchRoute;
+		dispatchViaInProcessServer: AndroidFullServerDispatch;
 		configFileExists: AndroidCoreRouteDeps["configFileExists"];
 		loadElizaConfig: AndroidCoreRouteDeps["loadElizaConfig"];
 		saveElizaConfig: AndroidCoreRouteDeps["saveElizaConfig"];
@@ -107,6 +111,7 @@ async function loadAgentModule(): Promise<AndroidAgentModule> {
 	return {
 		startEliza: mod.startEliza,
 		dispatchRoute: mod.dispatchRoute,
+		dispatchViaInProcessServer: mod.dispatchViaInProcessServer,
 		coreRoutes: {
 			configFileExists: mod.configFileExists,
 			loadElizaConfig: mod.loadElizaConfig,
@@ -249,6 +254,7 @@ function serveConnection(
 	runtime: IAgentRuntime,
 	dispatchRoute: AndroidDispatchRoute,
 	coreRoutes: AndroidCoreRouteDeps,
+	dispatchFullServer: AndroidFullServerDispatch,
 ): void {
 	const bridge = createStdioBridge({
 		request: async (frame) =>
@@ -257,6 +263,7 @@ function serveConnection(
 				dispatchRoute,
 				(frame.payload ?? {}) as AndroidRequestPayload,
 				coreRoutes,
+				dispatchFullServer,
 			),
 		requestStream: async (frame, sink) =>
 			dispatchStreamingRequest(
@@ -265,6 +272,7 @@ function serveConnection(
 				(frame.payload ?? {}) as AndroidRequestPayload,
 				sink,
 				coreRoutes,
+				dispatchFullServer,
 			),
 		writeFrame: (frame: StdioBridgeResponseFrame) => {
 			if (!socket.destroyed) socket.write(`${JSON.stringify(frame)}\n`);
@@ -303,13 +311,14 @@ function startLocalAgentServer(
 	runtime: IAgentRuntime,
 	dispatchRoute: AndroidDispatchRoute,
 	coreRoutes: AndroidCoreRouteDeps,
+	dispatchFullServer: AndroidFullServerDispatch,
 ): Promise<NodeServer> {
 	const name = localAgentSocketName();
 	// Abstract namespace: a leading NUL byte in the path (Linux). Mirrors
 	// BionicHostLoader's `net.connect({ path: "\0" + name })`.
 	const abstractPath = `\0${name}`;
 	const server = createNetServer((socket) => {
-		serveConnection(socket, runtime, dispatchRoute, coreRoutes);
+		serveConnection(socket, runtime, dispatchRoute, coreRoutes, dispatchFullServer);
 	});
 	return new Promise<NodeServer>((resolve, reject) => {
 		server.once("error", reject);
@@ -435,7 +444,8 @@ export async function runAndroidBridgeCli(): Promise<void> {
 	process.once("SIGINT", _earlyInt);
 
 	_logToFile("[android-bridge] importing agent module...");
-	const { startEliza, dispatchRoute, coreRoutes } = await loadAgentModule();
+	const { startEliza, dispatchRoute, dispatchViaInProcessServer, coreRoutes } =
+		await loadAgentModule();
 	_logToFile(
 		"[android-bridge] calling startEliza({ serverOnly: true, localAgentMode: true })...",
 	);
@@ -529,7 +539,12 @@ export async function runAndroidBridgeCli(): Promise<void> {
 
 	let server: NodeServer;
 	try {
-		server = await startLocalAgentServer(runtime, dispatchRoute, coreRoutes);
+		server = await startLocalAgentServer(
+			runtime,
+			dispatchRoute,
+			coreRoutes,
+			dispatchViaInProcessServer,
+		);
 	} catch (err) {
 		_logToFile(
 			`[android-bridge] failed to bind local-agent socket: ${
