@@ -2111,7 +2111,12 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
                   }
                 : {}),
             },
-            body: JSON.stringify({ text }),
+            // Request WAV when cloud voice is forced (LP3 / codec-less WebView):
+            // the cloud returns PCM16 WAV, which decodeAudioData handles without
+            // an MP3 codec. Default clients keep MP3.
+            body: JSON.stringify(
+              forceCloudTtsRef.current ? { text, format: "wav" } : { text },
+            ),
             signal: controller.signal,
           });
         } finally {

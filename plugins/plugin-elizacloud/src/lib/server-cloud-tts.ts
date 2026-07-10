@@ -194,6 +194,10 @@ export async function handleCloudTtsPreviewRoute(
   const cloudVoice = resolveElizaCloudTtsVoiceId(
     pickBodyString(body, "voiceId", "voice_id"),
   );
+  // Optional WAV passthrough: clients whose audio stack can't decode MP3 (the
+  // Light Phone III / LightOS WebView) send `format:"wav"`; forward it to the
+  // upstream so it returns PCM16 WAV. Default (unset) keeps the MP3 response.
+  const cloudFormat = body.format === "wav" ? "wav" : undefined;
   const cloudUrls = resolveCloudTtsCandidateUrls();
 
   const ttsPreview = ttsDebugTextPreview(text);
@@ -221,12 +225,13 @@ export async function handleCloudTtsPreviewRoute(
           Authorization: `Bearer ${cloudApiKey}`,
           "x-api-key": cloudApiKey,
           "Content-Type": "application/json",
-          Accept: "audio/mpeg",
+          Accept: cloudFormat === "wav" ? "audio/wav" : "audio/mpeg",
         },
         body: JSON.stringify({
           text,
           voiceId: cloudVoice,
           modelId: cloudModel,
+          ...(cloudFormat ? { format: cloudFormat } : {}),
         }),
       });
 
@@ -287,7 +292,16 @@ export async function handleCloudTtsPreviewRoute(
       ...dbgExtra,
     });
     res.statusCode = 200;
-    res.setHeader("Content-Type", "audio/mpeg");
+    // Relay the upstream container so a WAV request returns audio/wav (the MP3
+    // default is preserved when no format was requested).
+    res.setHeader(
+      "Content-Type",
+      cloudResponse.headers.get("content-type")?.startsWith("audio/")
+        ? (cloudResponse.headers.get("content-type") as string)
+        : cloudFormat === "wav"
+          ? "audio/wav"
+          : "audio/mpeg",
+    );
     res.setHeader("Cache-Control", "no-store");
     res.end(audioBuffer);
     return true;
