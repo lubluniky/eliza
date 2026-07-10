@@ -116,6 +116,20 @@ async function ensurePlaybackWorklet(ctx: AudioContext): Promise<void> {
   return pending;
 }
 
+/**
+ * Preload the playback worklet for `ctx` so the first spoken reply doesn't pay
+ * the AudioWorklet module load inline. On the LightOS WebView that load can
+ * take seconds while the talk-mode mic stream owns the audio pipeline — warm
+ * it at context creation, when nothing is waiting on the result.
+ */
+export function warmPlaybackWorklet(ctx: AudioContext): void {
+  if (!hasAudioWorklet(ctx)) return;
+  void ensurePlaybackWorklet(ctx).catch(() => {
+    // error-policy:J6 best-effort warm-up — a failed preload just means the
+    // first tapSource pays the load (or degrades to no visualizer) as before.
+  });
+}
+
 function clampPcm(value: number): number {
   if (!Number.isFinite(value)) return 0;
   return Math.max(-1, Math.min(1, value));

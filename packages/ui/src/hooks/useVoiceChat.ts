@@ -22,6 +22,7 @@ import {
   useState,
 } from "react";
 import type { VoiceConfig } from "../api/client";
+import { getCloudAuthToken } from "../api/client-cloud";
 import { fetchWithCsrf } from "../api/csrf-client";
 import {
   getElectrobunRendererRpc,
@@ -58,6 +59,7 @@ import {
 import {
   PlaybackFramePump,
   type PlaybackFrameTap,
+  warmPlaybackWorklet,
 } from "../voice/playback-frame-pump";
 import {
   currentSharedRuntimeVoiceOrigin,
@@ -651,6 +653,9 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
     try {
       if (!ctx) {
         ctx = new AudioContext({ latencyHint: "interactive" });
+        // Preload the visualizer worklet off the critical path (see
+        // warmPlaybackWorklet) — its inline load once stalled replies for seconds.
+        warmPlaybackWorklet(ctx);
         sharedAudioCtx = ctx;
       }
     } catch (error) {
@@ -1715,6 +1720,9 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
       let ctx = sharedAudioCtx;
       if (!ctx) {
         ctx = new AudioContext({ latencyHint: "interactive" });
+        // Preload the visualizer worklet off the critical path (see
+        // warmPlaybackWorklet) — its inline load once stalled replies for seconds.
+        warmPlaybackWorklet(ctx);
         sharedAudioCtx = ctx;
       }
       if (ctx.state === "suspended") {
@@ -1935,9 +1943,21 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
       audioSourceRef.current = source;
       // error-policy:J6 best-effort visualizer tap; if attaching the frame pump
       // fails, audio still plays — the tap only drives the waveform decoration.
-      const playbackTap = await getPlaybackFramePump()
+      // Do NOT gate playback on it either: the tap's first use per
+      // AudioContext loads an AudioWorklet module, which on the LightOS
+      // WebView can take many SECONDS while the talk-mode mic stream holds
+      // the audio pipeline — the spoken reply must never wait on decoration.
+      // Give it a short grace window, then start audio and late-attach the
+      // tap when the worklet finally comes up.
+      const tapPromise = getPlaybackFramePump()
         .tapSource(ctx, source, audioBuffer)
         .catch(() => null);
+      let playbackTap = await Promise.race([
+        tapPromise,
+        new Promise<Awaited<typeof tapPromise>>((resolveTap) =>
+          setTimeout(() => resolveTap(null), 150),
+        ),
+      ]);
 
       await new Promise<void>((resolve) => {
         let finished = false;
@@ -2036,6 +2056,9 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
       let ctx = sharedAudioCtx;
       if (!ctx) {
         ctx = new AudioContext({ latencyHint: "interactive" });
+        // Preload the visualizer worklet off the critical path (see
+        // warmPlaybackWorklet) — its inline load once stalled replies for seconds.
+        warmPlaybackWorklet(ctx);
         sharedAudioCtx = ctx;
       }
       if (ctx.state === "suspended") {
@@ -2070,76 +2093,150 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
       }
 
       if (!audioBytes) {
-        const controller = new AbortController();
-        activeFetchAbortRef.current = controller;
-        const timeoutId = setTimeout(() => {
-          controller.abort(
-            new DOMException("Eliza Cloud TTS timed out", "TimeoutError"),
-          );
-        }, CLOUD_TTS_TIMEOUT_MS);
-        let res: Response;
-        try {
-          const apiToken = getElizaApiToken()?.trim() ?? "";
-          const dbg = task.debugUtteranceContext;
-          // Shared-tier fallback (#15395): a shared-runtime agent has no
-          // `/api/tts/cloud` container route (404s), so target the cloud API
-          // worker's provider-agnostic v1 TTS route instead. Same `{ text }`
-          // JSON body, same audio-bytes response — no adaptation needed beyond
-          // the URL. Dedicated-tier agents keep `/api/tts/cloud` unchanged
-          // (sharedTtsOrigin is null for them).
-          const sharedTtsOrigin = currentSharedRuntimeVoiceOrigin();
-          const ttsTarget = sharedTtsOrigin
-            ? sharedRuntimeTtsUrl(sharedTtsOrigin)
-            : resolveApiUrl("/api/tts/cloud");
-          res = await fetchWithCsrf(ttsTarget, {
+        // Forced-cloud (`eliza:voice-cloud-tts`): call the cloud worker
+        // DIRECTLY with the cloud session token, bypassing the on-device
+        // agent's `/api/tts/cloud` proxy. The proxy hop re-downloads the WAV
+        // through the phone-side Bun event loop (busy with post-turn work and
+        // bridge polling) and re-marshals it as base64 over the IPC bridge —
+        // measured ~5-6s of added latency per reply on the LP3 while the
+        // worker itself finished in 1-2s.
+        const directCloudTtsToken = forceCloudTtsRef.current
+          ? (getCloudAuthToken()?.trim() ?? "")
+          : "";
+        // The direct call must go through the CapacitorHttp PLUGIN, not the
+        // patched window.fetch: the patch decodes response bodies as text and
+        // destroys bytes >0x7F (the WAV arrived as "RIFF�…" mojibake).
+        // With responseType "arraybuffer" the native layer returns base64,
+        // decoded to real bytes below.
+        const nativeHttpRequest = directCloudTtsToken
+          ? (
+              globalThis as {
+                Capacitor?: {
+                  Plugins?: {
+                    CapacitorHttp?: {
+                      request?: (options: {
+                        url: string;
+                        method: string;
+                        headers: Record<string, string>;
+                        data: unknown;
+                        responseType: string;
+                        connectTimeout: number;
+                        readTimeout: number;
+                      }) => Promise<{ status: number; data?: unknown }>;
+                    };
+                  };
+                };
+              }
+            ).Capacitor?.Plugins?.CapacitorHttp?.request
+          : undefined;
+
+        if (directCloudTtsToken && nativeHttpRequest) {
+          const nres = await nativeHttpRequest({
+            url: "https://api.elizacloud.ai/api/v1/voice/tts",
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              Accept: "audio/wav, audio/mpeg, audio/*;q=0.9",
-              ...(apiToken ? { Authorization: `Bearer ${apiToken}` } : {}),
-              ...(isTtsDebugEnabled() && dbg
-                ? {
-                    "x-elizaos-tts-message-id": encodeURIComponent(
-                      dbg.messageId,
-                    ),
-                    "x-elizaos-tts-clip-segment": encodeURIComponent(
-                      task.segment,
-                    ),
-                    "x-elizaos-tts-full-preview": encodeURIComponent(
-                      dbg.fullAssistTextPreview,
-                    ),
-                  }
-                : {}),
+              Accept: "audio/wav",
+              Authorization: `Bearer ${directCloudTtsToken}`,
             },
-            // Request WAV when cloud voice is forced (LP3 / codec-less WebView):
-            // the cloud returns PCM16 WAV, which decodeAudioData handles without
-            // an MP3 codec. Default clients keep MP3.
-            body: JSON.stringify(
-              forceCloudTtsRef.current ? { text, format: "wav" } : { text },
-            ),
-            signal: controller.signal,
+            data: { text, format: "wav" },
+            responseType: "arraybuffer",
+            connectTimeout: CLOUD_TTS_TIMEOUT_MS,
+            readTimeout: CLOUD_TTS_TIMEOUT_MS,
           });
-        } finally {
-          clearTimeout(timeoutId);
-          if (activeFetchAbortRef.current === controller) {
-            activeFetchAbortRef.current = null;
+          const base64 = typeof nres.data === "string" ? nres.data : "";
+          if (nres.status < 200 || nres.status >= 300 || !base64) {
+            ttsDebug("useVoiceChat:eliza-cloud-http-error", {
+              status: nres.status,
+              ttsTarget: "direct-cloud-native",
+              hadBearer: true,
+              bodyPreview: base64.slice(0, 120),
+            });
+            throw new Error(`Eliza Cloud TTS ${nres.status}`);
           }
-        }
+          const binary = atob(base64);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+          }
+          audioBytes = bytes;
+        } else {
+          const controller = new AbortController();
+          activeFetchAbortRef.current = controller;
+          const timeoutId = setTimeout(() => {
+            controller.abort(
+              new DOMException("Eliza Cloud TTS timed out", "TimeoutError"),
+            );
+          }, CLOUD_TTS_TIMEOUT_MS);
+          let res: Response;
+          try {
+            const apiToken = getElizaApiToken()?.trim() ?? "";
+            const dbg = task.debugUtteranceContext;
+            // Shared-tier fallback (#15395): a shared-runtime agent has no
+            // `/api/tts/cloud` container route (404s), so target the cloud API
+            // worker's provider-agnostic v1 TTS route instead. Same `{ text }`
+            // JSON body, same audio-bytes response — no adaptation needed beyond
+            // the URL. Dedicated-tier agents keep `/api/tts/cloud` unchanged
+            // (sharedTtsOrigin is null for them).
+            const sharedTtsOrigin = currentSharedRuntimeVoiceOrigin();
+            const ttsTarget = directCloudTtsToken
+              ? "https://api.elizacloud.ai/api/v1/voice/tts"
+              : sharedTtsOrigin
+                ? sharedRuntimeTtsUrl(sharedTtsOrigin)
+                : resolveApiUrl("/api/tts/cloud");
+            const ttsAuthToken = directCloudTtsToken || apiToken;
+            res = await fetchWithCsrf(ttsTarget, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Accept: "audio/wav, audio/mpeg, audio/*;q=0.9",
+                ...(ttsAuthToken
+                  ? { Authorization: `Bearer ${ttsAuthToken}` }
+                  : {}),
+                ...(isTtsDebugEnabled() && dbg
+                  ? {
+                      "x-elizaos-tts-message-id": encodeURIComponent(
+                        dbg.messageId,
+                      ),
+                      "x-elizaos-tts-clip-segment": encodeURIComponent(
+                        task.segment,
+                      ),
+                      "x-elizaos-tts-full-preview": encodeURIComponent(
+                        dbg.fullAssistTextPreview,
+                      ),
+                    }
+                  : {}),
+              },
+              // Request WAV when cloud voice is forced (LP3 / codec-less WebView):
+              // the cloud returns PCM16 WAV, which decodeAudioData handles without
+              // an MP3 codec. Default clients keep MP3.
+              body: JSON.stringify(
+                forceCloudTtsRef.current ? { text, format: "wav" } : { text },
+              ),
+              signal: controller.signal,
+            });
+          } finally {
+            clearTimeout(timeoutId);
+            if (activeFetchAbortRef.current === controller) {
+              activeFetchAbortRef.current = null;
+            }
+          }
 
-        if (!res.ok) {
-          const body = await res.text().catch(() => "");
-          ttsDebug("useVoiceChat:eliza-cloud-http-error", {
-            status: res.status,
-            ttsTarget: describeTtsCloudFetchTargetForDebug(),
-            hadBearer: Boolean(getElizaApiToken()?.trim()),
-            bodyPreview: body.slice(0, 120),
-          });
-          throw new Error(
-            `Eliza Cloud TTS ${res.status}: ${body.slice(0, 200)}`,
-          );
-        }
+          if (!res.ok) {
+            const body = await res.text().catch(() => "");
+            ttsDebug("useVoiceChat:eliza-cloud-http-error", {
+              status: res.status,
+              ttsTarget: describeTtsCloudFetchTargetForDebug(),
+              hadBearer: Boolean(getElizaApiToken()?.trim()),
+              bodyPreview: body.slice(0, 120),
+            });
+            throw new Error(
+              `Eliza Cloud TTS ${res.status}: ${body.slice(0, 200)}`,
+            );
+          }
 
-        audioBytes = new Uint8Array(await res.arrayBuffer());
+          audioBytes = new Uint8Array(await res.arrayBuffer());
+        }
         if (cacheKey) {
           rememberCachedSegment(cacheKey, audioBytes.slice());
         }
@@ -2193,9 +2290,21 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
       audioSourceRef.current = source;
       // error-policy:J6 best-effort visualizer tap; if attaching the frame pump
       // fails, audio still plays — the tap only drives the waveform decoration.
-      const playbackTap = await getPlaybackFramePump()
+      // Do NOT gate playback on it either: the tap's first use per
+      // AudioContext loads an AudioWorklet module, which on the LightOS
+      // WebView can take many SECONDS while the talk-mode mic stream holds
+      // the audio pipeline — the spoken reply must never wait on decoration.
+      // Give it a short grace window, then start audio and late-attach the
+      // tap when the worklet finally comes up.
+      const tapPromise = getPlaybackFramePump()
         .tapSource(ctx, source, audioBuffer)
         .catch(() => null);
+      let playbackTap = await Promise.race([
+        tapPromise,
+        new Promise<Awaited<typeof tapPromise>>((resolveTap) =>
+          setTimeout(() => resolveTap(null), 150),
+        ),
+      ]);
 
       await new Promise<void>((resolve) => {
         let finished = false;
@@ -2238,6 +2347,21 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
         if (playbackTap) {
           playbackFrameTapRef.current = playbackTap;
           playbackTap.start(playStartMs);
+        } else {
+          // Worklet still loading — attach the visualizer once it resolves,
+          // unless this clip already finished or was superseded.
+          void tapPromise.then((lateTap) => {
+            if (!lateTap) return;
+            if (finished || audioSourceRef.current !== source) {
+              void lateTap.stop({ reset: true }).catch(() => {
+                /* best effort only */
+              });
+              return;
+            }
+            playbackTap = lateTap;
+            playbackFrameTapRef.current = lateTap;
+            lateTap.start(playStartMs);
+          });
         }
         speechTimeoutRef.current = setTimeout(
           wrappedFinish,
@@ -2272,6 +2396,9 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
       let ctx = sharedAudioCtx;
       if (!ctx) {
         ctx = new AudioContext({ latencyHint: "interactive" });
+        // Preload the visualizer worklet off the critical path (see
+        // warmPlaybackWorklet) — its inline load once stalled replies for seconds.
+        warmPlaybackWorklet(ctx);
         sharedAudioCtx = ctx;
       }
       if (ctx.state === "suspended") {
@@ -2363,9 +2490,21 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
       audioSourceRef.current = source;
       // error-policy:J6 best-effort visualizer tap; if attaching the frame pump
       // fails, audio still plays — the tap only drives the waveform decoration.
-      const playbackTap = await getPlaybackFramePump()
+      // Do NOT gate playback on it either: the tap's first use per
+      // AudioContext loads an AudioWorklet module, which on the LightOS
+      // WebView can take many SECONDS while the talk-mode mic stream holds
+      // the audio pipeline — the spoken reply must never wait on decoration.
+      // Give it a short grace window, then start audio and late-attach the
+      // tap when the worklet finally comes up.
+      const tapPromise = getPlaybackFramePump()
         .tapSource(ctx, source, audioBuffer)
         .catch(() => null);
+      let playbackTap = await Promise.race([
+        tapPromise,
+        new Promise<Awaited<typeof tapPromise>>((resolveTap) =>
+          setTimeout(() => resolveTap(null), 150),
+        ),
+      ]);
 
       await new Promise<void>((resolve) => {
         let finished = false;
@@ -2408,6 +2547,21 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
         if (playbackTap) {
           playbackFrameTapRef.current = playbackTap;
           playbackTap.start(playStartMs);
+        } else {
+          // Worklet still loading — attach the visualizer once it resolves,
+          // unless this clip already finished or was superseded.
+          void tapPromise.then((lateTap) => {
+            if (!lateTap) return;
+            if (finished || audioSourceRef.current !== source) {
+              void lateTap.stop({ reset: true }).catch(() => {
+                /* best effort only */
+              });
+              return;
+            }
+            playbackTap = lateTap;
+            playbackFrameTapRef.current = lateTap;
+            lateTap.start(playStartMs);
+          });
         }
         speechTimeoutRef.current = setTimeout(
           wrappedFinish,
@@ -3067,11 +3221,25 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
       const current = assistantSpeechRef.current;
       if (!current || current.messageId !== messageId) {
         clearAssistantTtsDebounce();
+        // Temp→final promotion: a streaming reply is announced under a
+        // provisional temp-resp-* id, then re-announced with identical text
+        // under its persisted id. Resetting the spoken prefix on that id flip
+        // re-queued the WHOLE reply — an audible second copy of every voice
+        // answer (heard as her repeating herself late). Carry the prefix (and
+        // final-queued flag) over when the new text continues what this reply
+        // already queued.
+        const continuesSpokenText =
+          current !== null &&
+          current.queuedSpeakablePrefix.length > 0 &&
+          (speakable.startsWith(current.queuedSpeakablePrefix) ||
+            current.queuedSpeakablePrefix.startsWith(speakable));
         assistantSpeechRef.current = {
           messageId,
-          queuedSpeakablePrefix: "",
+          queuedSpeakablePrefix: continuesSpokenText
+            ? current.queuedSpeakablePrefix
+            : "",
           latestSpeakable: "",
-          finalQueued: false,
+          finalQueued: continuesSpokenText ? current.finalQueued : false,
           replacePlaybackOnFirstClip: queueOptions?.replace !== false,
           telemetry: queueOptions?.telemetry,
         };

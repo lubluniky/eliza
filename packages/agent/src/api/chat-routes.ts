@@ -444,10 +444,15 @@ function normalizeAndroidLocalDirectUserText(text: string): string {
 function buildAndroidLocalDirectChatPrompt(args: {
   runtime: AgentRuntime;
   userText: string;
+  /** Recent turns, oldest first, preformatted as "User: …" / "Eliza: …". */
+  historyLines: string[];
 }): string {
   const systemText = [
-    "You are Eliza, running on device.",
-    "Reply to the user's message in one natural sentence under 10 words. Stop after it.",
+    "You are Eliza, a helpful assistant running on this device.",
+    // A hard one-sentence cap made the assistant dodge every substantive ask
+    // ("ten facts about X" → "i'm not sure which facts you're looking for")
+    // and read as memoryless. Speakable-length replies, not a straitjacket.
+    "Reply conversationally in one to three short sentences.",
     // NOTE: do NOT hardcode a canned identity answer here. A prior
     // "If asked local/on-device: yes, local Eliza-1." line made the small
     // temperature-0 model default to emitting that exact sentence for garbled /
@@ -456,10 +461,15 @@ function buildAndroidLocalDirectChatPrompt(args: {
     // answer the actual message.
     "No markdown, labels, tools, logs, or hidden reasoning.",
   ].join("\n");
+  const history =
+    args.historyLines.length > 0
+      ? ["Recent conversation:", ...args.historyLines, ""].join("\n")
+      : "";
   return [
     "<start_of_turn>user",
     systemText,
     "",
+    history,
     escapeAndroidLocalChatTemplateTokens(args.userText),
     "<end_of_turn>",
     "<start_of_turn>model",
@@ -472,6 +482,53 @@ function buildAndroidLocalDirectChatPrompt(args: {
     "</think>",
     "",
   ].join("\n");
+}
+
+/**
+ * Recent room turns for the fast-path prompt, oldest first, each capped so a
+ * long pasted message can't blow the prompt budget. Without this the direct
+ * path answered every turn with zero conversation memory — the user's very
+ * first complaint in live voice use ("it doesn't have a memory").
+ */
+async function loadAndroidLocalDirectChatHistory(args: {
+  runtime: AgentRuntime;
+  roomId: UUID;
+  excludeMessageId?: UUID;
+}): Promise<string[]> {
+  try {
+    const memories = await args.runtime.getMemories({
+      tableName: "messages",
+      roomId: args.roomId,
+      count: 8,
+    });
+    return memories
+      .filter((m) => m.id !== args.excludeMessageId)
+      .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0))
+      .map((m) => {
+        const text =
+          typeof m.content?.text === "string" ? m.content.text.trim() : "";
+        if (!text) return "";
+        const speaker =
+          m.entityId === args.runtime.agentId
+            ? (args.runtime.character?.name ?? "Eliza")
+            : "User";
+        const capped = text.length > 240 ? `${text.slice(0, 240)}…` : text;
+        return `${speaker}: ${escapeAndroidLocalChatTemplateTokens(capped)}`;
+      })
+      .filter(Boolean)
+      .slice(-6);
+  } catch (err) {
+    // error-policy:J4 designed degrade — history is an enhancement to the
+    // voice fast path; a failed read must not silence the reply itself.
+    args.runtime.logger.warn(
+      {
+        src: "eliza-api",
+        err: err instanceof Error ? err.message : String(err),
+      },
+      "[eliza-api] Android local direct chat history read failed; replying without history",
+    );
+    return [];
+  }
 }
 
 function extractAndroidLocalModelText(raw: unknown): string {
@@ -503,11 +560,17 @@ function extractAndroidLocalModelText(raw: unknown): string {
   return "";
 }
 
-function truncateAndroidLocalReplyToFirstSentence(text: string): string {
+function truncateAndroidLocalReplyToSpokenLength(text: string): string {
   const compact = text.replace(/\s+/g, " ").trim();
   if (!compact) return "";
-  const firstSentence = compact.match(/^(.{12,280}?[.!?])(?:\s|$)/u)?.[1];
-  return (firstSentence ?? compact).trim();
+  // Cap at three sentences — the spoken-reply budget the prompt asks for. A
+  // first-sentence cut here used to guillotine every multi-sentence answer
+  // (list-style asks came back as a single dodge line).
+  const sentences = compact.match(/[^.!?]+[.!?]+(?:\s|$)/gu);
+  if (sentences && sentences.length > 3) {
+    return sentences.slice(0, 3).join("").trim();
+  }
+  return compact;
 }
 
 function stripAndroidLocalReasoning(text: string): string {
@@ -533,7 +596,7 @@ function cleanAndroidLocalDirectChatReply(raw: unknown): string {
     .replace(/^\s*(assistant|model|eliza)\s*:\s*/i, "")
     .replace(/\bEliza-1\b/gi, "Eliza-1")
     .trim();
-  text = truncateAndroidLocalReplyToFirstSentence(text);
+  text = truncateAndroidLocalReplyToSpokenLength(text);
   if (text.length <= 700) {
     return text;
   }
@@ -624,14 +687,22 @@ async function maybeGenerateAndroidLocalDirectChatResponse(args: {
     extractCompatTextContent(args.message.content),
   );
   if (!userText) return null;
+  const historyLines = await loadAndroidLocalDirectChatHistory({
+    runtime: args.runtime,
+    roomId: args.message.roomId,
+    excludeMessageId: args.message.id,
+  });
   const prompt = buildAndroidLocalDirectChatPrompt({
     runtime: args.runtime,
     userText,
+    historyLines,
   });
+  // 128 tokens ≈ the three-sentence spoken budget; the previous 20-token cap
+  // could not even fit one substantive sentence and forced dodge replies.
   const maxTokens = readPositiveIntegerSetting(
     args.runtime,
     "ELIZA_MOBILE_LOCAL_DIRECT_REPLY_MAX_TOKENS",
-    20,
+    128,
   );
   const startedAt = Date.now();
   args.runtime.logger.info(
@@ -677,10 +748,6 @@ async function maybeGenerateAndroidLocalDirectChatResponse(args: {
     providerOptions: {
       eliza: {
         thinking: "off",
-      },
-      androidLocal: {
-        stopOnFirstSentence: true,
-        minFirstSentenceChars: 12,
       },
     },
     signal: args.signal,

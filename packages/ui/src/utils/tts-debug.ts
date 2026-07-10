@@ -70,7 +70,9 @@ export function ttsDebug(
 ): void {
   if (!ttsDebugEnabled()) return;
   if (detail && Object.keys(detail).length > 0) {
-    console.info(`[eliza][tts] ${phase}`, detail);
+    // Stringify: Android WebView logcat renders a second console arg as
+    // "[object Object]", which makes on-device traces useless.
+    console.info(`[eliza][tts] ${phase} ${JSON.stringify(detail)}`);
   } else {
     console.info(`[eliza][tts] ${phase}`);
   }
