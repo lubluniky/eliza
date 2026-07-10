@@ -1,11 +1,6 @@
 /**
- * Regression coverage for the telemetry-mirror failure boundary inside
- * `LifeOpsRepository.createActivitySignal` (#15820): a failing mirror write
- * must never reject the already-committed signal insert, but it must surface
- * through `runtime.reportError` as a typed ElizaError with the original cause,
- * throttled to the first and every 100th consecutive failure. Deterministic:
- * drives the real repository, registry, and telemetry mapper against a fake
- * runtime DB that fails only the `life_telemetry_events` insert.
+ * Exercises activity-signal telemetry mirroring against a deterministic failing DB boundary.
+ * It verifies primary persistence, typed reporting, throttling, and counter reset.
  */
 
 import { ElizaError, type IAgentRuntime } from "@elizaos/core";
@@ -40,12 +35,8 @@ interface MirrorHarness {
   executedSignalInserts: () => number;
 }
 
-/**
- * Real `LifeOpsRepository` over a fake runtime DB: signal inserts always
- * succeed; telemetry inserts throw while `telemetryDown` is set. The signal
- * source registry is the real built-in registration, so the mirror path runs
- * the production mapper before hitting the failing write.
- */
+// The real repository and mapper run over a controllable DB boundary so each
+// test can fail only the derived telemetry write after the primary insert.
 function createMirrorHarness(): MirrorHarness {
   let telemetryDown = false;
   let signalInserts = 0;
