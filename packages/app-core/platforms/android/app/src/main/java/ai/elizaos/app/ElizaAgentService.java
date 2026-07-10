@@ -2190,8 +2190,22 @@ public class ElizaAgentService extends Service {
             // would fail with a cryptic "bionic socket error: connect ENOENT".
             boolean bionicJniBridgeBundled =
                 resolveBundledNativeLib(abiDir, "libelizavoicejni.so").isFile();
+            // OPT-IN CPU voice host (pref "eliza:voice-cpu-host"=1): the GPU
+            // backend (libggml-vulkan.so) is required only for GPU-offloaded
+            // TEXT; on-device VOICE — Kokoro TTS + Whisper ASR — runs on CPU
+            // inside the same fused engine. On GPUs where the ggml-vulkan
+            // backend SIGSEGVs at load (Qualcomm Adreno; the backend is
+            // Mali-proven only) a device can opt into bionic-host delegation
+            // with a self-contained CPU fused lib (no libggml-vulkan.so
+            // DT_NEEDED → no GPU probe → no crash) purely for the voice ops.
+            // Default behavior is byte-for-byte unchanged: without the pref the
+            // Vulkan lib is still required, exactly as before.
+            boolean cpuVoiceHostOptIn =
+                "1".equals(readCapacitorPref(this, "eliza:voice-cpu-host"));
             boolean delegateToBionicHost =
-                fusedInferenceBundled && abiGgmlVulkan.isFile() && bionicJniBridgeBundled;
+                fusedInferenceBundled
+                    && bionicJniBridgeBundled
+                    && (abiGgmlVulkan.isFile() || cpuVoiceHostOptIn);
             // #11760: export the device RAM class + idle-unload default so the
             // bun agent's in-process loader (plugin-aosp-local-inference) applies
             // the same inference memory policy as the bionic host. Operator env

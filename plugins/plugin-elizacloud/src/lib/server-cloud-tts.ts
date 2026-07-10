@@ -361,10 +361,49 @@ export async function handleCloudSttRoute(
   }
 
   const contentType = req.headers["content-type"];
+  // The Android local-agent IPC forwards STRING request bodies only, so the
+  // on-device WebView cannot POST raw audio bytes — it sends
+  // `{ audioBase64, mimeType }` JSON instead (mirrors the local-inference ASR
+  // route). Decode that to the same (bytes, mime) the raw-binary path uses so
+  // cloud STT works over the native bridge, not just over real HTTP.
+  let audioBytes: Buffer = rawBody;
+  let jsonMime: string | undefined;
+  if (
+    typeof contentType === "string" &&
+    contentType.includes("application/json")
+  ) {
+    try {
+      const parsed = JSON.parse(rawBody.toString("utf8")) as {
+        audioBase64?: unknown;
+        mimeType?: unknown;
+        mime?: unknown;
+      };
+      if (typeof parsed.audioBase64 === "string" && parsed.audioBase64) {
+        audioBytes = Buffer.from(parsed.audioBase64, "base64");
+        jsonMime =
+          typeof parsed.mimeType === "string"
+            ? parsed.mimeType
+            : typeof parsed.mime === "string"
+              ? parsed.mime
+              : undefined;
+      }
+    } catch {
+      // error-policy:J3 not the base64 envelope — fall through to the raw body.
+    }
+  }
+  if (audioBytes.length === 0) {
+    sendJsonErrorResponse(res, 400, "Missing audio body");
+    return true;
+  }
+
   const mime =
-    typeof contentType === "string" && contentType.trim()
-      ? contentType.split(";", 1)[0]?.trim() || "audio/wav"
-      : "audio/wav";
+    jsonMime && jsonMime.trim()
+      ? jsonMime.split(";", 1)[0]?.trim() || "audio/wav"
+      : typeof contentType === "string" &&
+          contentType.trim() &&
+          !contentType.includes("application/json")
+        ? contentType.split(";", 1)[0]?.trim() || "audio/wav"
+        : "audio/wav";
   const filename = mime.includes("wav") ? "recording.wav" : "recording.bin";
 
   const cloudUrls = resolveCloudSttCandidateUrls();
@@ -379,19 +418,29 @@ export async function handleCloudSttRoute(
     for (let i = 0; i < cloudUrls.length; i++) {
       const cloudUrl = cloudUrls[i];
       if (cloudUrl === undefined) continue;
-      const form = new FormData();
-      form.append(
-        "audio",
-        new Blob([new Uint8Array(rawBody)], { type: mime }),
-        filename,
+      // Build the multipart body by hand rather than via FormData: Bun's fetch
+      // on Android musl does not reliably emit the `multipart/form-data;
+      // boundary=…` Content-Type from a FormData body when an explicit `headers`
+      // object is present, so the upstream 400s ("Expected multipart form data
+      // with audio field"). Hand-assembling the body guarantees the boundary and
+      // part headers are correct on every runtime (web/desktop unaffected).
+      const boundary = "elizaformboundary7MA4YWxkTrZu0gW1r8x";
+      const partHead = Buffer.from(
+        `--${boundary}\r\n` +
+          `Content-Disposition: form-data; name="audio"; filename="${filename}"\r\n` +
+          `Content-Type: ${mime}\r\n\r\n`,
+        "utf8",
       );
+      const partTail = Buffer.from(`\r\n--${boundary}--\r\n`, "utf8");
+      const multipartBody = Buffer.concat([partHead, audioBytes, partTail]);
       const attempt = await fetch(cloudUrl, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${cloudApiKey}`,
           "x-api-key": cloudApiKey,
+          "Content-Type": `multipart/form-data; boundary=${boundary}`,
         },
-        body: form,
+        body: multipartBody,
       });
       if (attempt.ok) {
         cloudResponse = attempt;

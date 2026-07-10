@@ -53,7 +53,15 @@ export async function transcribeWavWithWords(
 	audioWav: Uint8Array,
 	signal?: AbortSignal,
 ): Promise<LocalAsrTranscript> {
-	if (await localInferenceEngine.available()) {
+	// On the bionic-delegated path the fused lib lives in the app process, not
+	// this musl agent — the engine's availability probe sees the staged .so on
+	// disk but dlopen would fail (the mobile fs-shim rejects the APK lib path
+	// outright). Route through the model chain instead, whose bionic
+	// TRANSCRIPTION handler forwards the audio to the in-process host over the
+	// UDS (op="asr").
+	const bionicDelegated =
+		process.env.ELIZA_BIONIC_HOST_DELEGATED?.trim() === "1";
+	if (!bionicDelegated && (await localInferenceEngine.available())) {
 		const audio = decodeMonoPcm16Wav(audioWav);
 		await localInferenceEngine.ensureActiveBundleAsrReady();
 		const { text, words } = await localInferenceEngine.transcribePcmTimed(

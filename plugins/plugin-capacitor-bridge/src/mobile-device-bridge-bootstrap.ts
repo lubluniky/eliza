@@ -2036,6 +2036,214 @@ function makeBionicImageDescriptionHandler() {
 	};
 }
 
+/** Wrap little-endian fp32 PCM bytes as a mono PCM16 WAV buffer. */
+function float32PcmToWav(f32le: Buffer, sampleRate: number): Buffer {
+	const samples = Math.floor(f32le.length / 4);
+	const pcm16 = Buffer.allocUnsafe(samples * 2);
+	for (let i = 0; i < samples; i++) {
+		const v = Math.max(-1, Math.min(1, f32le.readFloatLE(i * 4)));
+		pcm16.writeInt16LE(Math.round(v * 32767), i * 2);
+	}
+	const header = Buffer.alloc(44);
+	header.write("RIFF", 0, "ascii");
+	header.writeUInt32LE(36 + pcm16.length, 4);
+	header.write("WAVE", 8, "ascii");
+	header.write("fmt ", 12, "ascii");
+	header.writeUInt32LE(16, 16);
+	header.writeUInt16LE(1, 20); // PCM
+	header.writeUInt16LE(1, 22); // mono
+	header.writeUInt32LE(sampleRate, 24);
+	header.writeUInt32LE(sampleRate * 2, 28);
+	header.writeUInt16LE(2, 32);
+	header.writeUInt16LE(16, 34);
+	header.write("data", 36, "ascii");
+	header.writeUInt32LE(pcm16.length, 40);
+	return Buffer.concat([header, pcm16]);
+}
+
+/** Parse mono/stereo PCM16 WAV bytes into base64 fp32 mono PCM for op="asr". */
+function wavToFloat32Pcm(bytes: Uint8Array): {
+	pcmBase64: string;
+	sampleRate: number;
+} {
+	const buf = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	if (
+		buf.length < 44 ||
+		buf.toString("ascii", 0, 4) !== "RIFF" ||
+		buf.toString("ascii", 8, 12) !== "WAVE"
+	) {
+		throw new Error(
+			"[mobile-device-bridge] TRANSCRIPTION requires PCM16 WAV bytes",
+		);
+	}
+	let sampleRate = 16_000;
+	let bits = 16;
+	let channels = 1;
+	let dataOff = -1;
+	let dataLen = 0;
+	let off = 12;
+	while (off + 8 <= buf.length) {
+		const id = buf.toString("ascii", off, off + 4);
+		const size = buf.readUInt32LE(off + 4);
+		if (id === "fmt " && off + 24 <= buf.length) {
+			channels = buf.readUInt16LE(off + 10);
+			sampleRate = buf.readUInt32LE(off + 12);
+			bits = buf.readUInt16LE(off + 22);
+		} else if (id === "data") {
+			dataOff = off + 8;
+			dataLen = size;
+		}
+		off += 8 + size + (size % 2);
+	}
+	if (dataOff < 0 || bits !== 16 || channels < 1) {
+		throw new Error(
+			`[mobile-device-bridge] unsupported WAV (bits=${bits}, channels=${channels}); need PCM16`,
+		);
+	}
+	const end = Math.min(dataOff + dataLen, buf.length);
+	const frames = Math.floor((end - dataOff) / (2 * channels));
+	const out = Buffer.allocUnsafe(frames * 4);
+	for (let i = 0; i < frames; i++) {
+		// Take channel 0 — the host's fused ASR expects mono.
+		const s = buf.readInt16LE(dataOff + i * 2 * channels);
+		out.writeFloatLE(s / 32768, i * 4);
+	}
+	return { pcmBase64: out.toString("base64"), sampleRate };
+}
+
+/**
+ * On-device Kokoro TTS via the bionic host (op="tts"). The musl agent cannot
+ * load the fused libelizainference, so text forwards to the in-app host, which
+ * synthesizes with the Kokoro GGUF + voice preset under the bundle's
+ * tts/kokoro/ dir and returns fp32 PCM; wrapped here as PCM16 WAV so the TTS
+ * route's mime sniffer serves audio/wav. Only registered when bionic
+ * delegation is active — inert everywhere else.
+ */
+function makeBionicTtsHandler() {
+	return async (
+		_runtime: IAgentRuntime,
+		params: string | { text?: string; speed?: number },
+	) => {
+		const socketName = bionicSocketName();
+		if (!socketName) {
+			throw new Error(
+				"[mobile-device-bridge] TEXT_TO_SPEECH requires the bionic host (ELIZA_BIONIC_HOST_DELEGATED=1)",
+			);
+		}
+		const text = (
+			typeof params === "string" ? params : (params?.text ?? "")
+		).trim();
+		if (!text) {
+			throw new Error(
+				"[mobile-device-bridge] TEXT_TO_SPEECH requires non-empty text",
+			);
+		}
+		const speed =
+			typeof params === "object" && params && typeof params.speed === "number"
+				? params.speed
+				: 1.0;
+		const res = (await bionicHostGenerate(socketName, {
+			op: "tts",
+			bundleDir: "",
+			text,
+			speed,
+		})) as unknown as {
+			ok?: boolean;
+			error?: string;
+			sampleRate?: number;
+			pcmBase64?: string;
+		};
+		if (!res.ok || typeof res.pcmBase64 !== "string" || !res.pcmBase64) {
+			throw new Error(
+				`[mobile-device-bridge] bionic tts failed: ${res.error ?? "no audio returned"}`,
+			);
+		}
+		const sampleRate =
+			typeof res.sampleRate === "number" && res.sampleRate > 0
+				? res.sampleRate
+				: 24_000;
+		return float32PcmToWav(Buffer.from(res.pcmBase64, "base64"), sampleRate);
+	};
+}
+
+/**
+ * On-device Whisper/Gemma ASR via the bionic host (op="asr"): WAV bytes (or
+ * pre-decoded { pcm, sampleRateHz }) forward as fp32 mono PCM over the UDS and
+ * the fused engine's transcript comes back. Counterpart of
+ * {@link makeBionicTtsHandler}; same bionic-only registration.
+ */
+function makeBionicAsrHandler() {
+	return async (
+		_runtime: IAgentRuntime,
+		params:
+			| Uint8Array
+			| ArrayBuffer
+			| {
+					pcm?: Float32Array;
+					sampleRateHz?: number;
+					audio?: Uint8Array | ArrayBuffer;
+			  },
+	) => {
+		const socketName = bionicSocketName();
+		if (!socketName) {
+			throw new Error(
+				"[mobile-device-bridge] TRANSCRIPTION requires the bionic host (ELIZA_BIONIC_HOST_DELEGATED=1)",
+			);
+		}
+		let pcmBase64: string;
+		let sampleRate: number;
+		const obj = params as {
+			pcm?: Float32Array;
+			sampleRateHz?: number;
+			audio?: Uint8Array | ArrayBuffer;
+		};
+		if (obj?.pcm instanceof Float32Array && typeof obj.sampleRateHz === "number") {
+			const f = obj.pcm;
+			const out = Buffer.allocUnsafe(f.length * 4);
+			for (let i = 0; i < f.length; i++) out.writeFloatLE(f[i] ?? 0, i * 4);
+			pcmBase64 = out.toString("base64");
+			sampleRate = obj.sampleRateHz;
+		} else {
+			const raw =
+				params instanceof ArrayBuffer
+					? new Uint8Array(params)
+					: ArrayBuffer.isView(params)
+						? new Uint8Array(
+								params.buffer,
+								params.byteOffset,
+								params.byteLength,
+							)
+						: obj?.audio instanceof ArrayBuffer
+							? new Uint8Array(obj.audio)
+							: obj?.audio && ArrayBuffer.isView(obj.audio)
+								? new Uint8Array(
+										obj.audio.buffer,
+										obj.audio.byteOffset,
+										obj.audio.byteLength,
+									)
+								: null;
+			if (!raw) {
+				throw new Error(
+					"[mobile-device-bridge] TRANSCRIPTION requires WAV bytes or { pcm, sampleRateHz }",
+				);
+			}
+			({ pcmBase64, sampleRate } = wavToFloat32Pcm(raw));
+		}
+		const res = (await bionicHostGenerate(socketName, {
+			op: "asr",
+			bundleDir: "",
+			pcmBase64,
+			sampleRate,
+		})) as unknown as { ok?: boolean; error?: string; text?: string };
+		if (!res.ok) {
+			throw new Error(
+				`[mobile-device-bridge] bionic asr failed: ${res.error ?? "unknown error"}`,
+			);
+		}
+		return (res.text ?? "").trim();
+	};
+}
+
 /**
  * Register the capacitor-llama TEXT/embedding handlers on the runtime.
  *
@@ -2119,6 +2327,26 @@ function registerMobileDeviceBridgeModels(
 		);
 		logger.info(
 			"[mobile-device-bridge] Registered bionic IMAGE_DESCRIPTION handler (op=image)",
+		);
+		// On-device voice via the bionic host: Kokoro TTS (op="tts") + fused ASR
+		// (op="asr"). Both run on CPU inside the fused engine — no GPU required —
+		// and only serve when the host's bundle dir carries the voice models
+		// (tts/kokoro/*.gguf + voice .bin, asr/*.gguf); a missing model surfaces
+		// as the host's structured error, not a hang.
+		runtimeWithRegistration.registerModel(
+			ModelType.TEXT_TO_SPEECH,
+			makeBionicTtsHandler(),
+			PROVIDER,
+			LOCAL_INFERENCE_PRIORITY,
+		);
+		runtimeWithRegistration.registerModel(
+			ModelType.TRANSCRIPTION,
+			makeBionicAsrHandler(),
+			PROVIDER,
+			LOCAL_INFERENCE_PRIORITY,
+		);
+		logger.info(
+			"[mobile-device-bridge] Registered bionic TEXT_TO_SPEECH (op=tts) + TRANSCRIPTION (op=asr) handlers",
 		);
 	}
 	const embeddingModelPath = resolveLocalModelPath("TEXT_EMBEDDING");

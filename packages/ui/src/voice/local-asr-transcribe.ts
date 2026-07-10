@@ -207,13 +207,18 @@ export async function transcribeCloudWav(
         : await fetchWithCsrf(resolveApiUrl("/api/asr/cloud"), {
             method: "POST",
             headers: {
-              "Content-Type": "audio/wav",
+              // Send audio as base64 JSON, not a raw binary body: the Android
+              // local-agent IPC forwards STRING request bodies only, so a raw
+              // BufferSource POST 503s ("only supports string request bodies").
+              // The cloud STT proxy decodes { audioBase64, mimeType } identically
+              // to a raw body on every platform (web / desktop / native).
+              "Content-Type": "application/json",
               Accept: "application/json",
             },
-            // A Uint8Array is a valid BufferSource body; the cast bridges the
-            // DOM lib's stricter `ArrayBuffer` generic on BodyInit (runtime
-            // accepts it).
-            body: audio as BodyInit,
+            body: JSON.stringify({
+              audioBase64: bytesToBase64(audio),
+              mimeType: "audio/wav",
+            }),
             signal: timeoutController.signal,
           });
       if (!res.ok) {
