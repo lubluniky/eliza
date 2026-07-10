@@ -381,12 +381,19 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
     }
   });
 
+  // Opt-in cloud-voice override (see the pref-reading effect below). When set,
+  // it forces `cloudConnected` true in the config resolution so both STT and TTS
+  // resolve to the Eliza Cloud proxy on devices whose native voice legs are dead
+  // (Light Phone III). Declared here so the config memo can depend on it.
+  const forceCloudTtsRef = useRef(false);
+  const [forceCloudVoice, setForceCloudVoice] = useState(false);
+
   const effectiveVoiceConfig = useMemo(
     () =>
       resolveEffectiveVoiceConfig(options.voiceConfig, {
-        cloudConnected: options.cloudConnected,
+        cloudConnected: options.cloudConnected || forceCloudVoice,
       }),
-    [options.cloudConnected, options.voiceConfig],
+    [options.cloudConnected, options.voiceConfig, forceCloudVoice],
   );
 
   const assistantTtsQuality = useMemo((): "enhanced" | "standard" => {
@@ -426,13 +433,17 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
   const voiceConfigRef = useRef<VoiceConfig | null>(effectiveVoiceConfig);
   voiceConfigRef.current = effectiveVoiceConfig;
 
-  // Opt-in: speak the native talk-mode reply through Eliza Cloud Kokoro
-  // (`/api/tts/cloud`) instead of the on-device engine. Some devices (e.g. the
-  // Light Phone III) run the local agent over a Unix socket, not the TCP port
-  // the native TTS path dials, so the on-device reply can't connect there; this
-  // pref routes those devices to the cloud voice. Default false — Shaw's
-  // on-device-first default is unchanged unless `eliza:voice-cloud-tts` is set.
-  const forceCloudTtsRef = useRef(false);
+  // Opt-in (`eliza:voice-cloud-tts`): treat Eliza Cloud voice as available even
+  // when the hybrid config doesn't advertise it, so BOTH the mic's STT and the
+  // reply's TTS resolve to the cloud proxy (`/api/asr/cloud`, `/api/tts/cloud`).
+  // The Light Phone III has no native speech-recognition service and serves its
+  // local agent over a Unix socket (not the TCP port native TTS dials), so both
+  // native voice legs are dead there; routing the whole loop through the WebView
+  // cloud path is the only thing that works — and it also avoids the native
+  // mic-session vs WebView-playback audio-focus contention. `forceCloudVoice`
+  // is React state (drives the config memo below); the ref mirrors it for the
+  // synchronous TTS-queue callback. Default false — Shaw's on-device-first
+  // default is unchanged unless the pref is set.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -442,7 +453,9 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
           key: "eliza:voice-cloud-tts",
         });
         if (!cancelled) {
-          forceCloudTtsRef.current = value === "1" || value === "true";
+          const on = value === "1" || value === "true";
+          forceCloudTtsRef.current = on;
+          setForceCloudVoice(on);
         }
       } catch {
         // error-policy:J4 no preferences bridge (web/desktop) → keep the
