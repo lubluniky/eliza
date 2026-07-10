@@ -425,6 +425,34 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
   // Voice config ref (latest value always available to callbacks)
   const voiceConfigRef = useRef<VoiceConfig | null>(effectiveVoiceConfig);
   voiceConfigRef.current = effectiveVoiceConfig;
+
+  // Opt-in: speak the native talk-mode reply through Eliza Cloud Kokoro
+  // (`/api/tts/cloud`) instead of the on-device engine. Some devices (e.g. the
+  // Light Phone III) run the local agent over a Unix socket, not the TCP port
+  // the native TTS path dials, so the on-device reply can't connect there; this
+  // pref routes those devices to the cloud voice. Default false — Shaw's
+  // on-device-first default is unchanged unless `eliza:voice-cloud-tts` is set.
+  const forceCloudTtsRef = useRef(false);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const { Preferences } = await import("@capacitor/preferences");
+        const { value } = await Preferences.get({
+          key: "eliza:voice-cloud-tts",
+        });
+        if (!cancelled) {
+          forceCloudTtsRef.current = value === "1" || value === "true";
+        }
+      } catch {
+        // error-policy:J4 no preferences bridge (web/desktop) → keep the
+        // on-device default; this opt-in only applies to native shells.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const interruptOnSpeechRef = useRef(options.interruptOnSpeech ?? true);
   interruptOnSpeechRef.current = options.interruptOnSpeech ?? true;
   const onUserSpeechInterruptRef = useRef(options.onUserSpeechInterrupt);
@@ -2503,6 +2531,34 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
           // AudioContext path. Native errors fail closed below so the configured
           // voice is not silently swapped for a different engine.
           if (Capacitor.isNativePlatform()) {
+            // Opt-in cloud voice (`eliza:voice-cloud-tts`): speak the reply
+            // through Eliza Cloud Kokoro via the same web dispatch used on
+            // web/cloud, for devices whose on-device TTS port isn't reachable
+            // (the Light Phone III serves the agent over a Unix socket, so the
+            // native local path can't connect). Fails closed like the native
+            // path — no silent swap to a third engine.
+            if (forceCloudTtsRef.current) {
+              const trimmed = task.text.trim();
+              if (!trimmed) continue;
+              usingAudioAnalysisRef.current = true;
+              setUsingAudioAnalysis(true);
+              try {
+                await speakElizaCloud(trimmed, task, workerGeneration);
+                if (workerGeneration !== generationRef.current) break;
+                continue;
+              } catch (error) {
+                if (
+                  workerGeneration !== generationRef.current ||
+                  isAbortError(error)
+                ) {
+                  break;
+                }
+                usingAudioAnalysisRef.current = false;
+                setUsingAudioAnalysis(false);
+                failClosed("eliza-cloud", error);
+                break;
+              }
+            }
             const trimmed = task.text.trim();
             if (!trimmed) continue;
             usingAudioAnalysisRef.current = false;
