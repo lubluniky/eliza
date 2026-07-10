@@ -447,11 +447,35 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      try {
+      // Read the pref via the live Capacitor bridge first (the plugin proxy on
+      // `window.Capacitor.Plugins.Preferences`), falling back to the module
+      // import. The bridge proxy is the one that actually reaches native
+      // SharedPreferences under the app shell; the `@capacitor/preferences`
+      // module import can resolve to a web-stub in some bundling contexts and
+      // silently return no value — which is why the first cut of this opt-in
+      // never armed on-device.
+      const readPref = async (): Promise<string | null> => {
+        const bridge = (
+          globalThis as {
+            Capacitor?: {
+              Plugins?: {
+                Preferences?: {
+                  get?: (o: { key: string }) => Promise<{ value: string | null }>;
+                };
+              };
+            };
+          }
+        ).Capacitor?.Plugins?.Preferences;
+        if (typeof bridge?.get === "function") {
+          const { value } = await bridge.get({ key: "eliza:voice-cloud-tts" });
+          return value;
+        }
         const { Preferences } = await import("@capacitor/preferences");
-        const { value } = await Preferences.get({
-          key: "eliza:voice-cloud-tts",
-        });
+        const { value } = await Preferences.get({ key: "eliza:voice-cloud-tts" });
+        return value;
+      };
+      try {
+        const value = await readPref();
         if (!cancelled) {
           const on = value === "1" || value === "true";
           forceCloudTtsRef.current = on;
@@ -1094,7 +1118,13 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
   // the mic recorder; `sttBackendRef` = "cloud" routes the stop-time transcribe.
   const startCloudRecognition = useCallback(
     async (mode: Exclude<VoiceCaptureMode, "idle">) => {
-      if (!shouldUseCloudAsr(voiceConfigRef.current)) {
+      // `forceCloudTtsRef` (the `eliza:voice-cloud-tts` opt-in) makes cloud STT
+      // unconditional even when the resolved config didn't select it — the
+      // device's native/browser recognizers are unusable (Light Phone III has no
+      // speech-recognition service, and the app is its own RecognitionService, so
+      // a native attempt feeds an infinite hand-off loop). Cloud is the only
+      // viable transcriber there, so bypass the config gate.
+      if (!shouldUseCloudAsr(voiceConfigRef.current) && !forceCloudTtsRef.current) {
         return false;
       }
       // No WAV capture primitives (no getUserMedia / AudioContext) → there is no
@@ -1343,6 +1373,20 @@ export function useVoiceChat(options: VoiceChatOptions): VoiceChatState {
       const cloudStarted = await startCloudRecognition(mode);
       if (cloudStarted) {
         voiceCaptureDebug("provider:cloud", { mode });
+        return;
+      }
+
+      // Cloud-forced (`eliza:voice-cloud-tts`): never fall through to the native
+      // talk-mode or browser recognizers. Both route through the device
+      // SpeechRecognizer, which on the Light Phone III has no service AND is
+      // backed by the app's own ElizaRecognitionService — a native attempt there
+      // fails with "Client error (5)" and re-fires the `elizaos://voice` hand-off
+      // in a tight loop. Stop cleanly instead so the only transcriber is cloud.
+      if (forceCloudTtsRef.current) {
+        voiceCaptureDebug("provider:none", {
+          mode,
+          note: "cloud-forced; native/browser recognizer suppressed",
+        });
         return;
       }
 
