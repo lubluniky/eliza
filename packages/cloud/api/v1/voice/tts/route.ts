@@ -89,8 +89,11 @@ const TtsBody = z.object({
   format: z.enum(["mp3", "wav"]).optional(),
 });
 
-/** ElevenLabs PCM sample rate we request for the WAV path (Hz). */
-const WAV_PCM_SAMPLE_RATE = 24_000;
+/** ElevenLabs PCM sample rate for the WAV path (Hz). 16 kHz is ample for speech
+ *  and ~33% smaller than 24 kHz — the WAV is uncompressed, so on the codec-less
+ *  clients that need it the payload dominates transfer/decode latency (it rides
+ *  a base64 IPC bridge). Smaller = noticeably snappier replies. */
+const WAV_PCM_SAMPLE_RATE = 16_000;
 
 /** Prepend a canonical 44-byte PCM16 mono WAV header to raw little-endian
  *  16-bit PCM samples (what ElevenLabs `pcm_24000` streams). */
