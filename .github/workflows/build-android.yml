@@ -8,6 +8,11 @@ on:
         required: false
         type: boolean
         default: false
+      build_sol_dev_test_apk:
+        description: "Build a test APK that loads https://sol-dev.shad0w.xyz with realtime voice enabled"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: build-android-${{ github.ref }}
@@ -138,6 +143,10 @@ jobs:
 
       - name: Prepare Android platform
         working-directory: ${{ env.APP_DIR }}
+        env:
+          ELIZA_CAPACITOR_SERVER_URL: ${{ inputs.build_sol_dev_test_apk && 'https://sol-dev.shad0w.xyz' || '' }}
+          ELIZA_CAPACITOR_TEST_APK_ALLOW_PUBLIC_SERVER_URL: ${{ inputs.build_sol_dev_test_apk && '1' || '' }}
+          VITE_VOICE_REALTIME_WS: ${{ inputs.build_sol_dev_test_apk && '1' || '' }}
         run: bun run build:android
 
       - name: Run Android developer-install preflight
@@ -153,9 +162,12 @@ jobs:
       - name: Determine version
         id: version
         run: |
+          short_sha="$(git rev-parse --short=12 HEAD)"
           if [[ "${{ github.event_name }}" == "release" ]]; then
             VERSION="${{ github.event.release.tag_name }}"
             VERSION="${VERSION#v}"
+          elif [[ "${{ inputs.build_sol_dev_test_apk }}" == "true" ]]; then
+            VERSION="0.0.${GITHUB_RUN_NUMBER}-${short_sha}"
           else
             VERSION="0.0.0-dev"
           fi
@@ -165,6 +177,19 @@ jobs:
           IFS='.-' read -r major minor patch _ <<< "$VERSION"
           VERSION_CODE=$(( ${major:-0} * 10000 + ${minor:-0} * 100 + ${patch:-0} ))
           echo "version_code=$VERSION_CODE" >> $GITHUB_OUTPUT
+
+      - name: Summarize sol-dev test APK mode
+        if: github.event_name == 'workflow_dispatch' && inputs.build_sol_dev_test_apk
+        run: |
+          {
+            echo "### sol-dev test APK"
+            echo ""
+            echo "- Remote WebView server: https://sol-dev.shad0w.xyz"
+            echo "- Realtime voice flag: VITE_VOICE_REALTIME_WS=1"
+            echo "- Version name: ${{ steps.version.outputs.version }}"
+            echo ""
+            echo "No nginx auth key is embedded in source or the APK. Authenticate the WebView once by opening https://sol-dev.shad0w.xyz/__auth?k=<secret>; the existing HttpOnly sol_dev_auth cookie is then reused by normal app loads."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build debug APK
         if: github.event_name == 'workflow_dispatch'
@@ -220,7 +245,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: eliza-android-debug
+          name: ${{ inputs.build_sol_dev_test_apk && 'eliza-android-sol-dev-test-apk' || 'eliza-android-debug' }}
           path: ${{ env.ANDROID_DIR }}/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 7

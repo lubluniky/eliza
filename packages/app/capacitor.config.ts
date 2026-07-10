@@ -13,6 +13,8 @@ function isIosStoreBuild(): boolean {
   );
 }
 
+export const TEST_APK_PUBLIC_SERVER_HOST = "sol-dev.shad0w.xyz";
+
 function normalizeHost(host: string): string {
   return host
     .trim()
@@ -80,7 +82,27 @@ const iosApiBase = storeSafeAgentApiBase(
   iosRuntimeMode,
 );
 
-function resolveServerUrl(value: string | undefined): string | undefined {
+function isFlagEnabled(value: string | undefined): boolean {
+  return /^(1|true|yes|on)$/i.test((value ?? "").trim());
+}
+
+function isTestApkPublicServerAllowed(
+  parsed: URL,
+  allowPublicTestApkServer: boolean,
+): boolean {
+  return (
+    allowPublicTestApkServer &&
+    parsed.protocol === "https:" &&
+    normalizeHost(parsed.hostname) === TEST_APK_PUBLIC_SERVER_HOST &&
+    !parsed.username &&
+    !parsed.password
+  );
+}
+
+export function resolveServerUrl(
+  value: string | undefined,
+  allowPublicTestApkServer = false,
+): string | undefined {
   const trimmed = value?.trim();
   if (!trimmed || isIosStoreBuild()) return undefined;
   try {
@@ -88,7 +110,12 @@ function resolveServerUrl(value: string | undefined): string | undefined {
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
       return undefined;
     }
-    if (!isPrivateOrLoopbackHost(parsed.hostname)) return undefined;
+    if (
+      !isPrivateOrLoopbackHost(parsed.hostname) &&
+      !isTestApkPublicServerAllowed(parsed, allowPublicTestApkServer)
+    ) {
+      return undefined;
+    }
     return parsed.href.replace(/\/$/, "");
   } catch {
     // error-policy:J3 invalid test-only server URL disables the override
@@ -96,16 +123,23 @@ function resolveServerUrl(value: string | undefined): string | undefined {
   }
 }
 
-const serverUrl = resolveServerUrl(process.env.ELIZA_CAPACITOR_SERVER_URL);
+const allowTestApkPublicServer = isFlagEnabled(
+  process.env.ELIZA_CAPACITOR_TEST_APK_ALLOW_PUBLIC_SERVER_URL,
+);
+const serverUrl = resolveServerUrl(
+  process.env.ELIZA_CAPACITOR_SERVER_URL,
+  allowTestApkPublicServer,
+);
+const testApkPublicNavigationHosts =
+  serverUrl && new URL(serverUrl).hostname === TEST_APK_PUBLIC_SERVER_HOST
+    ? [TEST_APK_PUBLIC_SERVER_HOST]
+    : [];
 
 // E2E/test builds opt into WebView remote debugging via ELIZA_WEBVIEW_DEBUG=1.
 // This keeps the bundled APK assets and the real
 // on-device agent, but makes the System WebView CDP-attachable so Playwright's
 // Android driver (and chrome://inspect) can drive it for end-to-end tests. It
 // is NEVER enabled for store builds. Production builds leave it unset → off.
-function isFlagEnabled(value: string | undefined): boolean {
-  return /^(1|true|yes|on)$/i.test((value ?? "").trim());
-}
 const webViewDebuggingEnabled =
   !isIosStoreBuild() && isFlagEnabled(process.env.ELIZA_WEBVIEW_DEBUG);
 
@@ -134,6 +168,11 @@ const config: CapacitorConfig = {
     // Allow the webview to connect to the embedded API server
     allowNavigation: [
       ...localNavigationHosts,
+      // Test APKs may be pointed at the sol-dev host only when the explicit
+      // opt-in flag is set. The APK never carries the nginx auth key; the
+      // operator authenticates the WebView once at /__auth?k=<secret>, which
+      // leaves the existing HttpOnly sol_dev_auth cookie for normal app loads.
+      ...testApkPublicNavigationHosts,
       "*.elizacloud.ai",
       "eliza.app",
       "*.eliza.app",
