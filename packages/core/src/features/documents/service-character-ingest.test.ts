@@ -77,6 +77,83 @@ describe("DocumentService character document ingestion boot races", () => {
 		).toBe(true);
 	});
 
+	test("skips re-ingesting an existing content-id document that already has fragments", async () => {
+		// Complement of the zero-fragment reprocess below: when the
+		// content-addressed document already exists WITH fragments, addDocument
+		// must return the existing identity untouched — re-ingesting would
+		// re-embed every fragment and orphan rows mid-swap.
+		const created: Array<{ memory: Memory; table: string }> = [];
+		const deleted: UUID[] = [];
+		let existingDocumentId: UUID | null = null;
+
+		const runtime = createMockRuntime({
+			getSetting: () => undefined,
+			getModel: (type: string) =>
+				type === ModelType.TEXT_EMBEDDING
+					? async () => embeddingFor("registered")
+					: undefined,
+			getMemoryById: async (id: UUID) => {
+				existingDocumentId ??= id;
+				return {
+					id,
+					agentId: MOCK_AGENT_ID,
+					content: { text: "already ingested" },
+					metadata: { type: MemoryType.DOCUMENT, documentId: id },
+				} as Memory;
+			},
+			getMemories: async ({ tableName }) =>
+				tableName === DOCUMENT_FRAGMENTS_TABLE && existingDocumentId
+					? ([
+							{
+								id: "aaaaaaaa-0000-4000-8000-000000000001" as UUID,
+								agentId: MOCK_AGENT_ID,
+								content: { text: "fragment one" },
+								metadata: {
+									type: MemoryType.FRAGMENT,
+									documentId: existingDocumentId,
+									position: 0,
+								},
+							},
+							{
+								id: "aaaaaaaa-0000-4000-8000-000000000002" as UUID,
+								agentId: MOCK_AGENT_ID,
+								content: { text: "fragment two" },
+								metadata: {
+									type: MemoryType.FRAGMENT,
+									documentId: existingDocumentId,
+									position: 1,
+								},
+							},
+						] as Memory[])
+					: [],
+			deleteMemory: async (id: UUID) => {
+				deleted.push(id);
+			},
+			createMemory: async (memory: Memory, table: string): Promise<UUID> => {
+				created.push({ memory, table });
+				return memory.id as UUID;
+			},
+			updateMemory: async () => true,
+		});
+		const service = new DocumentService(runtime);
+
+		const result = await service.addDocument({
+			agentId: MOCK_AGENT_ID,
+			worldId: MOCK_AGENT_ID,
+			roomId: MOCK_AGENT_ID,
+			entityId: MOCK_AGENT_ID,
+			content: "A document that was already fully ingested.",
+			contentType: "text/plain",
+			originalFilename: "already-there.txt",
+		});
+
+		expect(result.clientDocumentId).toBe(existingDocumentId);
+		expect(result.fragmentCount).toBe(2);
+		// Nothing written, nothing deleted — the stored rows are untouched.
+		expect(created).toHaveLength(0);
+		expect(deleted).toHaveLength(0);
+	});
+
 	test("reprocesses an existing content-id document stub when it has zero fragments", async () => {
 		const created: Array<{ memory: Memory; table: string }> = [];
 		const deleted: UUID[] = [];

@@ -171,6 +171,74 @@ describe("DocumentService — batched fragment embedding (TEXT_EMBEDDING_BATCH)"
 		}
 	});
 
+	test("pre-chunked producer fragments (#14806) each persist with the vector of their OWN text, anchors intact", async () => {
+		// The fragments seam takes the all-or-nothing pre-chunked path instead of
+		// the splitter; the ordering invariant this file pins — the right vector
+		// lands on the right fragment — must hold there too, or a search hit's
+		// startMs/endMs anchor would rank on a neighbouring segment's embedding.
+		const captured: Captured = { fragments: [], documents: [] };
+
+		const runtime = createMockRuntime({
+			// Local embedding keeps validateModelConfig from demanding an API key;
+			// rate limiting off keeps the test instant.
+			getSetting: (key: string) => {
+				if (key === "EMBEDDING_PROVIDER") return "local";
+				if (key === "RATE_LIMIT_ENABLED") return "false";
+				return undefined;
+			},
+			getMemoryById: async () => null,
+			getMemories: async () => [],
+			updateMemory: async () => true,
+			createMemory: captureCreateMemory(captured),
+			getModel: () => undefined,
+			useModel: (type: string, params: { text?: string }) => {
+				if (type !== ModelType.TEXT_EMBEDDING) {
+					throw new Error(`unexpected model ${type}`);
+				}
+				return Promise.resolve(vecOf(params.text ?? ""));
+			},
+			addEmbeddingToMemory: async (memory: Memory) => {
+				memory.embedding = vecOf(memory.content.text ?? "");
+				return memory;
+			},
+		});
+
+		const service = new DocumentService(runtime);
+		const res = await service.addDocument({
+			worldId: runtime.agentId,
+			roomId: runtime.agentId,
+			entityId: runtime.agentId,
+			clientDocumentId: ITEM_ID,
+			contentType: "text/plain",
+			originalFilename: "standup.txt",
+			content: "Alice: hello there\nBob: hi",
+			metadata: { transcriptId: "t-1", source: "transcript" },
+			fragments: [
+				{
+					text: "Alice: hello there",
+					metadata: { segmentIds: ["s1"], startMs: 0, endMs: 1000 },
+				},
+				{
+					text: "Bob: hi",
+					metadata: { segmentIds: ["s2"], startMs: 1200, endMs: 2000 },
+				},
+			],
+		});
+
+		expect(res.fragmentCount).toBe(2);
+		expect(captured.fragments).toHaveLength(2);
+		for (const fragment of captured.fragments) {
+			// Vector traces back to THIS fragment's exact text.
+			expect(fragment.embedding).toEqual(vecOf(fragment.content.text ?? ""));
+		}
+		// The anchors rode along untouched next to the correctly-paired vectors.
+		const metas = captured.fragments.map(
+			(f) => f.metadata as Record<string, unknown>,
+		);
+		expect(metas.map((m) => m.startMs)).toEqual([0, 1200]);
+		expect(metas.map((m) => m.endMs)).toEqual([1000, 2000]);
+	});
+
 	test("batch returns the wrong vector count → falls back to serial (no fragment left unembedded)", async () => {
 		let batchCalls = 0;
 		let serialEmbedCalls = 0;

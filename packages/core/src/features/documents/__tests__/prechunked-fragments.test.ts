@@ -307,6 +307,54 @@ describe("processFragmentsSynchronously — pre-chunked fragments", () => {
 		expect(meta.startMs).toBeUndefined();
 		expect(meta.segmentIds).toBeUndefined();
 	});
+
+	it("splitter path with BATCH_EMBEDDINGS=true embeds via one batched call, still no anchor keys", async () => {
+		// Unchanged-behavior pin for the OTHER embedding route the fragments seam
+		// sits next to: opt-in batch embeddings must not start attaching anchor
+		// keys to split chunks, and every chunk must persist with an embedding
+		// from the single texts[] round-trip.
+		const { runtime, writes } = buildRuntime();
+		runtime.getSetting = vi.fn((key: string) => {
+			if (key === "EMBEDDING_PROVIDER") return "local";
+			if (key === "RATE_LIMIT_ENABLED") return "false";
+			if (key === "BATCH_EMBEDDINGS") return "true";
+			return undefined;
+		}) as never;
+		let batchCalls = 0;
+		runtime.useModel = vi.fn(
+			async (
+				modelType: string,
+				params: { text?: string; texts?: string[] },
+			) => {
+				if (modelType !== ModelType.TEXT_EMBEDDING) {
+					throw new Error(`Unexpected model call: ${modelType}`);
+				}
+				if (Array.isArray(params.texts)) {
+					batchCalls += 1;
+					return params.texts.map(() => [0.1, 0.2, 0.3]);
+				}
+				return [0.1, 0.2, 0.3];
+			},
+		) as never;
+
+		const count = await processFragmentsSynchronously({
+			runtime: runtime as never,
+			documentId: DOC_ID,
+			fullDocumentText: "plain body text embedded through the batch route",
+			agentId: runtime.agentId,
+		});
+
+		expect(count).toBeGreaterThan(0);
+		expect(batchCalls).toBe(1);
+		const rows = fragmentWrites(writes);
+		expect(rows).toHaveLength(count);
+		for (const row of rows) {
+			expect(row.embedding).toEqual([0.1, 0.2, 0.3]);
+			const meta = row.metadata as Record<string, unknown>;
+			expect(meta.startMs).toBeUndefined();
+			expect(meta.segmentIds).toBeUndefined();
+		}
+	});
 });
 
 describe("DocumentService.addDocument — fragments plumb through end to end", () => {
@@ -446,5 +494,105 @@ describe("DocumentService.addDocument — fragments plumb through end to end", (
 		expect(anchorMeta.endMs).toBe(1000);
 		expect(anchorMeta.segmentIds).toEqual(["s1"]);
 		expect(anchorMeta.transcriptId).toBe("t-1");
+	});
+});
+
+describe("DocumentService — stored transcript document lifecycle", () => {
+	/** Ingest one anchored transcript document and serve its rows back through
+	 * the runtime stub, so list/get/delete run against exactly what the
+	 * fragments seam persisted. */
+	async function ingestTranscriptDoc() {
+		const { runtime, writes } = buildRuntime();
+		const svc = new (
+			DocumentService as new (
+				runtime: unknown,
+			) => DocumentService
+		)(runtime);
+		const res = await svc.addDocument({
+			worldId: runtime.agentId,
+			roomId: runtime.agentId,
+			entityId: runtime.agentId,
+			clientDocumentId: DOC_ID,
+			contentType: "text/plain",
+			originalFilename: "standup.txt",
+			content: "Alice: hello there\nBob: hi",
+			metadata: { transcriptId: "t-1", source: "transcript" },
+			fragments: [
+				{
+					text: "Alice: hello there",
+					metadata: { segmentIds: ["s1"], startMs: 0, endMs: 1000 },
+				},
+				{
+					text: "Bob: hi",
+					metadata: { segmentIds: ["s2"], startMs: 1200, endMs: 2000 },
+				},
+			],
+		});
+		const docRow = writes.find((w) => w.tableName === "documents")?.memory;
+		if (!docRow) throw new Error("ingest persisted no document row");
+		const fragmentRows = fragmentWrites(writes);
+		runtime.getMemoryById = vi.fn(async (id: UUID) =>
+			id === docRow.id ? docRow : null,
+		) as never;
+		runtime.getMemories = vi.fn(
+			async ({ tableName }: { tableName: string }) => {
+				if (tableName === "documents") return [docRow];
+				if (tableName === "document_fragments") return fragmentRows;
+				return [];
+			},
+		) as never;
+		return { runtime, svc, res, docRow, fragmentRows };
+	}
+
+	it("getDocumentById returns the stored parent but never a fragment row", async () => {
+		const { runtime, svc, res, docRow, fragmentRows } =
+			await ingestTranscriptDoc();
+		const fetched = await svc.getDocumentById(res.clientDocumentId as UUID);
+		expect(fetched).toBe(docRow);
+
+		// A fragment id resolves to a FRAGMENT-typed memory — the document read
+		// must reject it rather than hand an anchor fragment out as a document.
+		runtime.getMemoryById = vi.fn(async () => fragmentRows[0]) as never;
+		const missing = await svc.getDocumentById(fragmentRows[0].id as UUID);
+		expect(missing).toBeNull();
+	});
+
+	it("listDocuments surfaces the stored transcript document and honors the query filter", async () => {
+		const { svc } = await ingestTranscriptDoc();
+		const listed = await svc.listDocuments(undefined, { query: "standup" });
+		expect(listed).toHaveLength(1);
+		expect((listed[0].metadata as Record<string, unknown>).transcriptId).toBe(
+			"t-1",
+		);
+		// A non-matching query narrows to nothing rather than echoing the store.
+		const none = await svc.listDocuments(undefined, {
+			query: "no-such-meeting",
+		});
+		expect(none).toHaveLength(0);
+	});
+
+	it("deleteDocument removes every anchored fragment row and then the parent", async () => {
+		const { runtime, svc, res, fragmentRows } = await ingestTranscriptDoc();
+		await svc.deleteDocument(res.clientDocumentId as UUID);
+
+		// Anchor-carrying fragments must not outlive their document: both
+		// fragment rows are deleted, and the parent goes last so a concurrent
+		// reader never sees a document whose fragments are already gone.
+		const deleted = (
+			runtime.deleteMemory as unknown as ReturnType<typeof vi.fn>
+		).mock.calls.map((call) => call[0]);
+		expect(deleted).toHaveLength(fragmentRows.length + 1);
+		for (const fragment of fragmentRows) {
+			expect(deleted).toContain(fragment.id);
+		}
+		expect(deleted[deleted.length - 1]).toBe(res.clientDocumentId);
+	});
+
+	it("deleteDocument throws for an unknown document id without touching fragment rows", async () => {
+		const { runtime, svc } = await ingestTranscriptDoc();
+		await expect(
+			svc.deleteDocument("99999999-9999-4999-8999-999999999999" as UUID),
+		).rejects.toThrow(/not found/);
+		expect(runtime.deleteMemory).not.toHaveBeenCalled();
 	});
 });

@@ -325,3 +325,174 @@ describe("documentAction.handler structured routing", () => {
 		expect(res?.values).toMatchObject({ error: "service_unavailable" });
 	});
 });
+
+// ── Mutation routing + document-scope access ───────────────────────────────
+//
+// edit/delete resolve the target from the structured documentId, then gate on
+// the DOCUMENT'S OWN visibility scope before touching the service write. The
+// stub runtime has no role infrastructure, so role resolution deterministically
+// bottoms out at the USER floor — a plain user can mutate documents scoped to
+// their own entity and nothing else.
+
+describe("documentAction.handler edit/delete routing + access", () => {
+	function userPrivateDoc(): Memory {
+		return {
+			id: DOC_ID,
+			entityId: USER_ID,
+			agentId: AGENT_ID,
+			roomId: ROOM_ID,
+			content: { text: "original body" },
+			metadata: { scope: "user-private", scopedToEntityId: USER_ID },
+			createdAt: Date.now(),
+		} as Memory;
+	}
+
+	it("routes edit to updateDocument when the sender owns the user-private document", async () => {
+		const service = makeService();
+		service.getDocumentById.mockResolvedValueOnce(userPrivateDoc() as never);
+		const { runtime } = makeRuntime(service);
+
+		const res = await documentAction.handler?.(
+			runtime,
+			makeMessage("no uuid here"),
+			undefined,
+			options({ action: "edit", documentId: DOC_ID, text: "Updated body." }),
+		);
+
+		expect(service.updateDocument).toHaveBeenCalledTimes(1);
+		expect(service.updateDocument.mock.calls[0]?.[0]).toMatchObject({
+			documentId: DOC_ID,
+			content: "Updated body.",
+		});
+		expect(res?.success).toBe(true);
+		expect(res?.data).toMatchObject({ subaction: "edit" });
+	});
+
+	it("refuses to edit a global document for a plain user (owner-only) without writing", async () => {
+		const service = makeService();
+		// No scope metadata → the document defaults to the global scope.
+		service.getDocumentById.mockResolvedValueOnce({
+			id: DOC_ID,
+			content: { text: "shared body" },
+			metadata: {},
+		} as never);
+		const { runtime } = makeRuntime(service);
+
+		const res = await documentAction.handler?.(
+			runtime,
+			makeMessage("edit it"),
+			undefined,
+			options({ action: "edit", documentId: DOC_ID, text: "hijacked" }),
+		);
+
+		expect(service.updateDocument).not.toHaveBeenCalled();
+		expect(res?.success).toBe(false);
+		expect(res?.values).toMatchObject({ error: "forbidden" });
+	});
+
+	it("requires non-empty text to edit (no service read or write)", async () => {
+		const service = makeService();
+		const { runtime } = makeRuntime(service);
+
+		const res = await documentAction.handler?.(
+			runtime,
+			makeMessage("edit it"),
+			undefined,
+			options({ action: "edit", documentId: DOC_ID, text: "   " }),
+		);
+
+		expect(service.getDocumentById).not.toHaveBeenCalled();
+		expect(service.updateDocument).not.toHaveBeenCalled();
+		expect(res?.success).toBe(false);
+		expect(res?.values).toMatchObject({ error: "missing_text" });
+	});
+
+	it("routes delete to deleteDocument when the sender owns the user-private document", async () => {
+		const service = makeService();
+		service.getDocumentById.mockResolvedValueOnce(userPrivateDoc() as never);
+		const { runtime } = makeRuntime(service);
+
+		const res = await documentAction.handler?.(
+			runtime,
+			makeMessage("no uuid here"),
+			undefined,
+			options({ action: "delete", documentId: DOC_ID }),
+		);
+
+		expect(service.deleteDocument).toHaveBeenCalledWith(
+			DOC_ID,
+			expect.anything(),
+		);
+		expect(res?.success).toBe(true);
+		expect(res?.values).toMatchObject({ documentId: DOC_ID });
+	});
+
+	it("refuses to delete an owner-private document for a plain user", async () => {
+		const service = makeService();
+		service.getDocumentById.mockResolvedValueOnce({
+			id: DOC_ID,
+			content: { text: "owner note" },
+			metadata: { scope: "owner-private" },
+		} as never);
+		const { runtime } = makeRuntime(service);
+
+		const res = await documentAction.handler?.(
+			runtime,
+			makeMessage("delete it"),
+			undefined,
+			options({ action: "delete", documentId: DOC_ID }),
+		);
+
+		expect(service.deleteDocument).not.toHaveBeenCalled();
+		expect(res?.success).toBe(false);
+		expect(res?.values).toMatchObject({ error: "forbidden" });
+	});
+
+	it("reports not_found when deleting a document the service cannot resolve", async () => {
+		const service = makeService();
+		const { runtime } = makeRuntime(service);
+
+		const res = await documentAction.handler?.(
+			runtime,
+			makeMessage("no uuid here"),
+			undefined,
+			options({ action: "delete", documentId: DOC_ID }),
+		);
+
+		expect(service.getDocumentById).toHaveBeenCalledTimes(1);
+		expect(service.deleteDocument).not.toHaveBeenCalled();
+		expect(res?.success).toBe(false);
+		expect(res?.values).toMatchObject({ error: "not_found" });
+	});
+
+	it("imports inline content as a user-private text note via import_file", async () => {
+		const service = makeService();
+		const { runtime } = makeRuntime(service);
+
+		const res = await documentAction.handler?.(
+			runtime,
+			makeMessage("keep this note"),
+			undefined,
+			options({
+				action: "import_file",
+				content: "Quarterly plan: ship the anchors slice.",
+				title: "Quarterly plan",
+			}),
+		);
+
+		expect(service.addDocument).toHaveBeenCalledTimes(1);
+		expect(service.addDocument.mock.calls[0]?.[0]).toMatchObject({
+			content: "Quarterly plan: ship the anchors slice.",
+			contentType: "text/plain",
+			scope: "user-private",
+			scopedToEntityId: USER_ID,
+			metadata: expect.objectContaining({
+				source: "file",
+				title: "Quarterly plan",
+				textBacked: true,
+			}),
+		});
+		expect(res?.success).toBe(true);
+		expect(res?.values).toMatchObject({ scope: "user-private" });
+	});
+});

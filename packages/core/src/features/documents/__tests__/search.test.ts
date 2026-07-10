@@ -267,6 +267,48 @@ describe("DocumentService.searchDocuments", () => {
 			expect(results).toHaveLength(0);
 		});
 
+		it("preserves transcript anchor metadata on hits and fabricates none (#14806)", async () => {
+			// The search layer must hand anchor fields through untouched: a
+			// transcript fragment's startMs/endMs/segmentIds survive scoring and
+			// mapping, and a plain fragment gains no anchor keys on the way out —
+			// downstream DTO projection depends on absence meaning "not a
+			// transcript hit", not "zeroed".
+			const fragments = [
+				makeFragment("frag-anchored", "quantum roadmap discussion", undefined, {
+					transcriptId: "t-1",
+					segmentIds: ["s1", "s2"],
+					startMs: 61_000,
+					endMs: 62_500,
+				}),
+				makeFragment("frag-plain", "quantum roadmap notes"),
+			];
+			const rt = buildRuntime({ hasEmbedding: false, fragments });
+			const svc = buildService(rt);
+
+			const results = await svc.searchDocuments(
+				makeMessage("quantum roadmap"),
+				undefined,
+				"keyword",
+			);
+
+			expect(results.map((r) => r.id).sort()).toEqual([
+				"frag-anchored",
+				"frag-plain",
+			]);
+			const anchored = results.find((r) => r.id === "frag-anchored");
+			expect(anchored?.metadata).toMatchObject({
+				transcriptId: "t-1",
+				segmentIds: ["s1", "s2"],
+				startMs: 61_000,
+				endMs: 62_500,
+			});
+			const plain = results.find((r) => r.id === "frag-plain");
+			const plainMeta = plain?.metadata as Record<string, unknown>;
+			expect(plainMeta.transcriptId).toBeUndefined();
+			expect(plainMeta.startMs).toBeUndefined();
+			expect(plainMeta.endMs).toBeUndefined();
+		});
+
 		it("filters user-private fragments to the scoped user", async () => {
 			const userOne = "user-1" as UUID;
 			const userTwo = "user-2" as UUID;

@@ -8,12 +8,14 @@ import {
 
 const addDocument = vi.fn();
 const searchDocuments = vi.fn();
+const getMemories = vi.fn(async () => []);
 
 vi.mock("@elizaos/agent/api/documents-service-loader", () => ({
   getDocumentsService: vi.fn(async () => ({
     service: {
       addDocument,
       searchDocuments,
+      getMemories,
     },
   })),
   getDocumentsServiceTimeoutMs: vi.fn(() => 0),
@@ -483,6 +485,133 @@ describe("document routes", () => {
       }
     ).metadata;
     expect(passedMetadata.mediaUrl).toBeUndefined();
+  });
+
+  it("lists a transcript document's fragments in position order, excluding other documents' rows", async () => {
+    // The read side of the fragments seam (#14806): the fragments a producer
+    // stored for one document come back position-ordered and never bleed in
+    // rows that belong to a different documentId.
+    const docId = "33333333-4444-4333-8444-555555555555";
+    const parentDoc = {
+      id: docId,
+      agentId: "agent-id",
+      content: { text: "Alice: hello there\nBob: hi" },
+      createdAt: 1_000,
+      metadata: { type: "document", documentId: docId, transcriptId: "t-1" },
+    };
+    getMemories.mockResolvedValueOnce([
+      // Deliberately out of position order + a foreign-document row.
+      {
+        id: "frag-2",
+        createdAt: 1_002,
+        content: { text: "Bob: hi" },
+        metadata: { documentId: docId, position: 1 },
+      },
+      {
+        id: "frag-other",
+        createdAt: 1_003,
+        content: { text: "unrelated" },
+        metadata: { documentId: "another-doc", position: 0 },
+      },
+      {
+        id: "frag-1",
+        createdAt: 1_001,
+        content: { text: "Alice: hello there" },
+        metadata: { documentId: docId, position: 0 },
+      },
+    ]);
+    const { ctx, res } = buildCtx({
+      method: "GET",
+      pathname: `/api/documents/${docId}/fragments`,
+    });
+    const runtime = ctx.runtime as NonNullable<DocumentRouteContext["runtime"]>;
+    vi.mocked(runtime.getMemoryById).mockResolvedValueOnce(parentDoc as never);
+
+    await expect(handleDocumentsRoutes(ctx)).resolves.toBe(true);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toEqual({
+      documentId: docId,
+      fragments: [
+        {
+          id: "frag-1",
+          text: "Alice: hello there",
+          position: 0,
+          createdAt: 1_001,
+        },
+        { id: "frag-2", text: "Bob: hi", position: 1, createdAt: 1_002 },
+      ],
+      count: 2,
+    });
+  });
+
+  it("404s the fragments listing for an unknown document without scanning fragments", async () => {
+    const { ctx, res } = buildCtx({
+      method: "GET",
+      pathname: "/api/documents/33333333-4444-4333-8444-555555555555/fragments",
+    });
+    const runtime = ctx.runtime as NonNullable<DocumentRouteContext["runtime"]>;
+    vi.mocked(runtime.getMemoryById).mockResolvedValueOnce(null as never);
+
+    await expect(handleDocumentsRoutes(ctx)).resolves.toBe(true);
+
+    expect(res.statusCode).toBe(404);
+    expect(res.body).toEqual({ error: "Document not found" });
+    expect(getMemories).not.toHaveBeenCalled();
+  });
+
+  it("returns a transcript-mirrored document with its fragment count and audio deep-link fields", async () => {
+    const docId = "33333333-4444-4333-8444-555555555555";
+    getMemories.mockResolvedValueOnce([
+      {
+        id: "frag-1",
+        createdAt: 1_001,
+        content: { text: "Alice: hello there" },
+        metadata: { documentId: docId, position: 0 },
+      },
+      {
+        id: "frag-2",
+        createdAt: 1_002,
+        content: { text: "Bob: hi" },
+        metadata: { documentId: docId, position: 1 },
+      },
+      {
+        id: "frag-other",
+        createdAt: 1_003,
+        content: { text: "unrelated" },
+        metadata: { documentId: "another-doc", position: 0 },
+      },
+    ]);
+    const { ctx, res } = buildCtx({
+      method: "GET",
+      pathname: `/api/documents/${docId}`,
+    });
+    const runtime = ctx.runtime as NonNullable<DocumentRouteContext["runtime"]>;
+    vi.mocked(runtime.getMemoryById).mockResolvedValueOnce({
+      id: docId,
+      agentId: "agent-id",
+      content: { text: "Alice: hello there\nBob: hi" },
+      createdAt: 1_000,
+      metadata: {
+        type: "document",
+        documentId: docId,
+        transcriptId: "t-1",
+        audioUrl: "/api/media/abc.wav",
+        title: "standup",
+      },
+    } as never);
+
+    await expect(handleDocumentsRoutes(ctx)).resolves.toBe(true);
+
+    expect(res.statusCode).toBe(200);
+    const body = res.body as { document: Record<string, unknown> };
+    expect(body.document).toMatchObject({
+      id: docId,
+      fragmentCount: 2,
+      // The transcript deep-link fields a search hit seeks through (#14806).
+      transcriptId: "t-1",
+      transcriptAudioUrl: "/api/media/abc.wav",
+    });
   });
 
   it.each([
