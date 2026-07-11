@@ -32,6 +32,15 @@ import {
   rateLimit,
 } from "@/lib/middleware/rate-limit-hono-cloudflare";
 import {
+  bindProviderDispatchTelemetry,
+  type GatewayPreforwardTiming,
+  invokeWithProviderDispatchTelemetry,
+  type ProviderDispatchTelemetry,
+  resolveElizaTraceId,
+  snapshotGatewayPreforwardTiming,
+  withGatewayPreforwardTelemetry,
+} from "@/lib/observability/http-telemetry";
+import {
   calculateCost,
   estimateTokens,
   getProviderFromModel,
@@ -1032,6 +1041,8 @@ function shouldUsePooledNoopReservation(params: {
 
 interface ChatCompletionsHandlerOptions {
   skipOrgRateLimit?: boolean;
+  /** Stable application trace id supplied by the outer Worker middleware. */
+  traceId?: string;
   /**
    * Cloudflare ExecutionContext. When present, the post-response billing /
    * settlement chain (billUsage → settleReservation → reconcileCredits →
@@ -1052,6 +1063,13 @@ export async function handleChatCompletionsPOST(
   options: ChatCompletionsHandlerOptions = {},
 ) {
   const startTime = Date.now();
+  const telemetryStartedAt = performance.now();
+  const traceId = options.traceId ?? resolveElizaTraceId(req.headers);
+  let preforwardTiming: GatewayPreforwardTiming | undefined;
+  const attachPreforwardTelemetry = (response: Response): Response =>
+    preforwardTiming
+      ? withGatewayPreforwardTelemetry(response, traceId, preforwardTiming)
+      : response;
   // #11588: the billing requestId feeds the affiliate-earnings dedupe sourceId
   // (getAffiliateEarningsSourceId → `ai_billing:<op>:<requestId>`, deduped on
   // addEarnings) while the org charge is unconditional. It MUST NOT be
@@ -1115,7 +1133,7 @@ export async function handleChatCompletionsPOST(
     // pre-forward work, not the model. These marks split it (auth vs the
     // rate-limit/app/catalog/moderation reads vs the reserve write) so the next
     // fix targets the real cross-region-Railway hotspot instead of guessing.
-    const tAuth = Date.now();
+    const tAuth = performance.now();
 
     // 1b. Per-org tier rate limit. Start it beside body parsing: rate-limit
     // still wins over malformed bodies, matching the pre-existing gate order.
@@ -1348,7 +1366,7 @@ export async function handleChatCompletionsPOST(
       effectiveMaxTokens ?? request.max_tokens ?? 500;
     const affiliateCode = req.headers.get("X-Affiliate-Code");
 
-    const tBeforeReserve = Date.now();
+    const tBeforeReserve = performance.now();
     let reservation: CreditReservation | null = null;
     // #9899 Tier-2: set when the optimistic off-path billing branch is taken;
     // replaces the reservation settler with a deferred actual-cost debit.
@@ -1670,7 +1688,7 @@ export async function handleChatCompletionsPOST(
       }
       settleReservation = createCreditReservationSettler(reservation);
     }
-    const tAfterReserve = Date.now();
+    const tAfterReserve = performance.now();
 
     // 7. Convert messages for AI SDK
     const systemMessage = request.messages.find((m) => m.role === "system");
@@ -1683,6 +1701,7 @@ export async function handleChatCompletionsPOST(
     const modelMessages = convertToModelMessagesFromOpenAI(nonSystemMessages);
 
     logger.info("[Chat Completions] Request", {
+      traceId,
       model,
       messageCount: request.messages.length,
       streaming: request.stream,
@@ -1690,19 +1709,35 @@ export async function handleChatCompletionsPOST(
       webSearchEnabled: webSearchActive,
     });
 
-    // Pre-forward latency breakdown (#9899). authMs = auth+org DB lookup;
-    // midReadsMs = rate-limit + app + reasoning-catalog + moderation (these run
-    // serially and are independent → the parallelization candidate); reserveMs =
-    // the credit-reservation DB write; totalMs = everything before the model
-    // call. Compare against cerebras-direct ~0.24s to see how much of TTFT is us.
-    logger.info("[Chat Completions][preforward]", {
-      model,
-      authMs: tAuth - startTime,
-      midReadsMs: tBeforeReserve - tAuth,
-      reserveMs: tAfterReserve - tBeforeReserve,
-      totalMs: Date.now() - startTime,
-      stream: request.stream === true,
-    });
+    // Capture at the actual provider-dispatch boundary inside the streaming or
+    // non-streaming helper. This includes all synchronous request conversion
+    // and provider setup while excluding provider-to-headers latency.
+    let providerDispatchAt: number | undefined;
+    const providerDispatchTelemetry: ProviderDispatchTelemetry = {
+      capture: () => {
+        providerDispatchAt ??= performance.now();
+      },
+      emit: () => {
+        if (providerDispatchAt === undefined || preforwardTiming) return;
+        preforwardTiming = snapshotGatewayPreforwardTiming({
+          authMs: tAuth - telemetryStartedAt,
+          middleMs: tBeforeReserve - tAuth,
+          reserveMs: tAfterReserve - tBeforeReserve,
+          setupMs: providerDispatchAt - tAfterReserve,
+          totalMs: providerDispatchAt - telemetryStartedAt,
+        });
+        logger.info("[Chat Completions][preforward]", {
+          traceId,
+          model,
+          authMs: preforwardTiming.authMs,
+          midReadsMs: preforwardTiming.middleMs,
+          reserveMs: preforwardTiming.reserveMs,
+          setupMs: preforwardTiming.setupMs,
+          totalMs: preforwardTiming.totalMs,
+          stream: request.stream === true,
+        });
+      },
+    };
 
     // 8. Handle streaming vs non-streaming
     const preforwardResponse = request.stream
@@ -1729,6 +1764,7 @@ export async function handleChatCompletionsPOST(
           pooledCredential,
           useMonetizedAppBilling,
           options.executionCtx,
+          providerDispatchTelemetry,
         )
       : await handleNonStreamingRequest(
           model,
@@ -1752,25 +1788,22 @@ export async function handleChatCompletionsPOST(
           pooledCredential,
           useMonetizedAppBilling,
           options.executionCtx,
+          providerDispatchTelemetry,
         );
-    // Emit per-step pre-forward timing as a readable header (#9899). Debug-only
-    // numbers, no behavior change. totalMs = everything before the model
-    // forward; compare vs cerebras-direct ~0.24s to see how much of TTFT is us.
-    try {
-      preforwardResponse.headers.set(
-        "X-Eliza-Preforward-Ms",
-        `total=${Date.now() - startTime};auth=${tAuth - startTime};mid=${tBeforeReserve - tAuth};reserve=${tAfterReserve - tBeforeReserve}`,
+    if (!preforwardTiming) {
+      throw new Error(
+        "[Chat Completions] provider dispatch timing was not captured",
       );
-    } catch {
-      // error-policy:J6 debug-only header; immutable Response headers must not
-      // fail an otherwise valid provider response.
-      // Some Response shapes have immutable headers — never fail a request for a debug header.
     }
-    return preforwardResponse;
+    // Re-wrap instead of mutating a fetch Response, whose headers can be
+    // immutable. The body passes through unchanged, so streaming stays
+    // zero-buffered.
+    return attachPreforwardTelemetry(preforwardResponse);
   } catch (error) {
     await settleReservation?.(0);
     const rawMessage = error instanceof Error ? error.message : String(error);
     logger.error("[Chat Completions] Error", {
+      traceId,
       error: rawMessage,
       cause:
         error instanceof Error && error.cause
@@ -1783,16 +1816,18 @@ export async function handleChatCompletionsPOST(
     // To the caller the deterministic truth is that this deployment cannot
     // serve the requested model.
     if (isProviderConfigurationError(error)) {
-      return addCorsHeaders(
-        Response.json(
-          {
-            error: {
-              message: modelNotAvailableMessage(model),
-              type: "invalid_request_error",
-              code: "model_not_available",
+      return attachPreforwardTelemetry(
+        addCorsHeaders(
+          Response.json(
+            {
+              error: {
+                message: modelNotAvailableMessage(model),
+                type: "invalid_request_error",
+                code: "model_not_available",
+              },
             },
-          },
-          { status: 400 },
+            { status: 400 },
+          ),
         ),
       );
     }
@@ -1811,15 +1846,17 @@ export async function handleChatCompletionsPOST(
       : (getRecoverableProviderErrorStatus(error) ?? getErrorStatusCode(error));
     const errorType = openAiErrorTypeForStatus(status);
 
-    return addCorsHeaders(
-      Response.json(
-        {
-          error: {
-            message: errorMessage,
-            type: errorType,
+    return attachPreforwardTelemetry(
+      addCorsHeaders(
+        Response.json(
+          {
+            error: {
+              message: errorMessage,
+              type: errorType,
+            },
           },
-        },
-        { status },
+          { status },
+        ),
       ),
     );
   }
@@ -2127,6 +2164,7 @@ async function tryPassthroughStreamingRequest(params: {
   effectiveMaxTokens: number | undefined;
   billingSource: PricingBillingSource;
   executionCtx?: { waitUntil(promise: Promise<unknown>): void };
+  providerDispatchTelemetry?: ProviderDispatchTelemetry;
 }): Promise<Response | null> {
   const { model, request, settleReservation } = params;
   if (!isPassthroughStreamingEnabled()) return null;
@@ -2187,16 +2225,20 @@ async function tryPassthroughStreamingRequest(params: {
   }
 
   let upstreamResponse: Response;
+  const upstreamInit: RequestInit = {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${upstream.apiKey}`,
+    },
+    body: JSON.stringify(upstreamBody),
+    ...(signals.length ? { signal: AbortSignal.any(signals) } : {}),
+  };
   try {
-    upstreamResponse = await fetch(upstream.url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${upstream.apiKey}`,
-      },
-      body: JSON.stringify(upstreamBody),
-      ...(signals.length ? { signal: AbortSignal.any(signals) } : {}),
-    });
+    upstreamResponse = await invokeWithProviderDispatchTelemetry(
+      params.providerDispatchTelemetry,
+      () => fetch(upstream.url, upstreamInit),
+    );
   } catch (error) {
     // Nothing was delivered — release the full hold, exactly like onError.
     await settleReservation(0);
@@ -2397,6 +2439,7 @@ async function handleStreamingRequest(
   pooledCredential: PooledInferenceCredential | null,
   useMonetizedAppBilling: boolean,
   executionCtx?: { waitUntil(promise: Promise<unknown>): void },
+  providerDispatchTelemetry?: ProviderDispatchTelemetry,
 ) {
   // #15428 pass-through fast path: qualifying plain streamed chat against a
   // direct OpenAI-compatible upstream pipes the provider bytes straight
@@ -2428,6 +2471,7 @@ async function handleStreamingRequest(
       effectiveMaxTokens,
       billingSource,
       executionCtx,
+      providerDispatchTelemetry,
     });
     if (passthroughResponse) return passthroughResponse;
   }
@@ -2499,8 +2543,13 @@ async function handleStreamingRequest(
     request.reasoning_effort ?? undefined,
   );
 
-  const result = streamText({
-    model: getLanguageModel(model, pooledCredential ?? undefined),
+  const languageModel = getLanguageModel(model, pooledCredential ?? undefined);
+  const dispatchStreamText = bindProviderDispatchTelemetry(
+    providerDispatchTelemetry,
+    (options: Parameters<typeof streamText>[0]) => streamText(options),
+  );
+  const result = dispatchStreamText({
+    model: languageModel,
     system: systemPrompt,
     messages,
     ...webSearchOptions,
@@ -2510,7 +2559,9 @@ async function handleStreamingRequest(
     ...(tools ? { tools } : {}),
     ...(toolChoice ? { toolChoice } : {}),
     ...(experimentalOutput ? { output: experimentalOutput } : {}),
-    ...(effectiveMaxTokens != null && { maxOutputTokens: effectiveMaxTokens }),
+    ...(effectiveMaxTokens != null && {
+      maxOutputTokens: effectiveMaxTokens,
+    }),
     ...cotOptions,
     ...reasoningProviderOptions,
     // Parity with the non-streaming path (#8759): the settlement chain below
@@ -2948,6 +2999,7 @@ async function handleNonStreamingRequest(
   pooledCredential: PooledInferenceCredential | null,
   useMonetizedAppBilling: boolean,
   executionCtx: { waitUntil(promise: Promise<unknown>): void } | undefined,
+  providerDispatchTelemetry?: ProviderDispatchTelemetry,
 ) {
   const provider = getProviderFromModel(model);
   const tools = convertTools(request.tools);
@@ -2972,8 +3024,16 @@ async function handleNonStreamingRequest(
   );
 
   try {
-    const result = await generateText({
-      model: getLanguageModel(model, pooledCredential ?? undefined),
+    const languageModel = getLanguageModel(
+      model,
+      pooledCredential ?? undefined,
+    );
+    const dispatchGenerateText = bindProviderDispatchTelemetry(
+      providerDispatchTelemetry,
+      (options: Parameters<typeof generateText>[0]) => generateText(options),
+    );
+    const result = await dispatchGenerateText({
+      model: languageModel,
       system: systemPrompt,
       messages,
       ...webSearchOptions,
@@ -3168,6 +3228,7 @@ honoRouter.post("/", rateLimit(RateLimitPresets.RELAXED), async (c) => {
   try {
     return await handleChatCompletionsPOST(c.req.raw, {
       executionCtx: c.executionCtx,
+      traceId: c.get("traceId"),
     });
   } catch (error) {
     // error-policy:J1 route boundary — every catch in v1/chat/* translates a thrown error into a structured HTTP failure via failureResponse (never a fabricated 200/empty completion). Credit reservations are released before rethrow on the streaming paths above.
